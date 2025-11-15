@@ -1,1 +1,3 @@
 /venv
+peer/__pycache__/
+tests/__pycache__/

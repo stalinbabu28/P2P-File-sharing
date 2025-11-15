@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Reputation] - %(levelname)s - %(message)s')

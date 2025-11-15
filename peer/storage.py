@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from typing import Dict, Any, Set, Optional
+from typing import Dict, Any, Set, Optional, List
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Storage] - %(levelname)s - %(message)s')
@@ -50,7 +50,8 @@ class StorageManager:
                     self.chunk_tracker = {h: set(c) for h, c in chunk_data.items()}
                 logging.info(f"Loaded storage metadata from {self.metadata_file}")
             else:
-                logging.info("No existing metadata file found. Starting fresh.")
+                logging.info("No existing metadata file found. Starting fresh and creating one.")
+                self._save_metadata() # <-- This line is new
         except json.JSONDecodeError:
             logging.error(f"Error decoding metadata file. Starting fresh.")
             self.file_metadata = {}
