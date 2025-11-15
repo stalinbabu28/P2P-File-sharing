@@ -1,17 +1,70 @@
-"""Minimal CLI to run a peer."""
+import sys
 import argparse
-from .peer import Peer
+import time
+import logging
+import os
 
+# --- Add project root to Python path ---
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+
+from peer.peer import Peer
+
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [CLI] - %(levelname)s - %(message)s')
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--id', default='peer1')
-    parser.add_argument('--dir', default='./data')
+    parser = argparse.ArgumentParser(description="P2P File Sharing Peer")
+    
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    
+    # --- 'share' command ---
+    share_parser = subparsers.add_parser('share', help="Share a file with the network")
+    share_parser.add_argument('file_path', type=str, help="The path to the file you want to share")
+    
+    # --- 'download' command ---
+    download_parser = subparsers.add_parser('download', help="Download a file from the network")
+    download_parser.add_argument('file_hash', type=str, help="The SHA-256 hash of the file to download")
+    
+    # --- 'daemon' command (to just run as a seeder) ---
+    daemon_parser = subparsers.add_parser('daemon', help="Run as a daemon to seed files")
+
     args = parser.parse_args()
+    
+    # --- Initialize and run the peer ---
+    try:
+        peer = Peer()
+        peer.start_server()
+        
+        # --- NEW: Start persistent tracker connection ---
+        peer.start_tracker_connection()
+        
+        # Always register, even if just running as a daemon
+        peer.register_with_tracker()
 
-    p = Peer(args.id, storage_dir=args.dir)
-    print('Files:', p.list_files())
+        if args.command == 'share':
+            logging.info(f"CLI: Executing 'share' command for {args.file_path}")
+            peer.share_file(args.file_path)
+            logging.info("Share command complete. Peer will continue running as a daemon.")
+            
+        elif args.command == 'download':
+            logging.info(f"CLI: Executing 'download' command for {args.file_hash}")
+            peer.download_file(args.file_hash)
+            logging.info("Download command complete. Peer will continue running as a daemon.")
+            
+        elif args.command == 'daemon':
+            logging.info("CLI: Running in daemon mode. Seeding files...")
 
-if __name__ == '__main__':
+        # Keep the main thread alive to let the server thread run
+        while True:
+            time.sleep(1)
+            
+    except KeyboardInterrupt:
+        logging.info("CLI: Shutdown signal received.")
+    finally:
+        if 'peer' in locals():
+            peer.stop()
+        logging.info("CLI: Exiting.")
+
+if __name__ == "__main__":
     main()
- 
