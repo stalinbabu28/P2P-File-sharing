@@ -4,7 +4,8 @@ import os
 from typing import List, Tuple, Optional
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Reputation] - %(levelname)s - %(message)s')
+# Get a logger for this specific module
+logger = logging.getLogger(__name__)
 
 # --- Reputation Update Rules (from PDF, Page 6) ---
 REPUTATION_RULES = {
@@ -36,7 +37,7 @@ class ReputationManager:
         
         self.conn = self._init_db()
         if self.conn is None:
-            logging.error("Failed to initialize reputation database. Reputation system will be disabled.")
+            logger.error("Failed to initialize reputation database. Reputation system will be disabled.")
     
     def _init_db(self) -> Optional[sqlite3.Connection]:
         """Initializes the SQLite database and 'reputation' table."""
@@ -56,10 +57,10 @@ class ReputationManager:
                 )
             ''')
             conn.commit()
-            logging.info(f"Reputation database initialized at {self.db_path}")
+            logger.info(f"Reputation database initialized at {self.db_path}")
             return conn
         except sqlite3.Error as e:
-            logging.error(f"Error initializing reputation database: {e}")
+            logger.error(f"Error initializing reputation database: {e}")
             return None
 
     def get_reputation(self, peer_id: str) -> float:
@@ -78,7 +79,7 @@ class ReputationManager:
                 # Peer not in DB, return default score
                 return DEFAULT_REPUTATION
         except sqlite3.Error as e:
-            logging.error(f"Error getting reputation for {peer_id}: {e}")
+            logger.error(f"Error getting reputation for {peer_id}: {e}")
             return DEFAULT_REPUTATION # Return default on error
 
     def update_reputation(self, peer_id: str, event_type: str):
@@ -91,7 +92,7 @@ class ReputationManager:
 
         delta_r = REPUTATION_RULES.get(event_type)
         if delta_r is None:
-            logging.warning(f"Unknown reputation event type: {event_type}")
+            logger.warning(f"Unknown reputation event type: {event_type}")
             return
 
         try:
@@ -123,10 +124,12 @@ class ReputationManager:
             ''', (peer_id, new_score, interactions + 1))
             
             self.conn.commit()
-            logging.info(f"Updated reputation for {peer_id}: {old_score:.2f} -> {new_score:.2f} (Event: {event_type})")
+            
+            # Changed from logging.INFO to logging.DEBUG for clean tqdm
+            logger.debug(f"Updated reputation for {peer_id}: {old_score:.2f} -> {new_score:.2f} (Event: {event_type})")
             
         except sqlite3.Error as e:
-            logging.error(f"Error updating reputation for {peer_id}: {e}")
+            logger.error(f"Error updating reputation for {peer_id}: {e}")
 
     def get_peers_sorted_by_reputation(self, peer_ids: List[str]) -> List[Tuple[str, float]]:
         """
@@ -138,8 +141,6 @@ class ReputationManager:
             return [(peer_id, DEFAULT_REPUTATION) for peer_id in peer_ids]
 
         try:
-            # This is not the most efficient way (N+1 queries), but it's simple
-            # A better way would be a single query: "WHERE peer_id IN (...)"
             peer_scores = []
             for peer_id in peer_ids:
                 peer_scores.append((peer_id, self.get_reputation(peer_id)))
@@ -150,7 +151,7 @@ class ReputationManager:
             return peer_scores
             
         except Exception as e:
-            logging.error(f"Error sorting peers by reputation: {e}")
+            logger.error(f"Error sorting peers by reputation: {e}")
             # Fallback
             return [(peer_id, DEFAULT_REPUTATION) for peer_id in peer_ids]
     
@@ -158,4 +159,4 @@ class ReputationManager:
         """Closes the database connection."""
         if self.conn:
             self.conn.close()
-            logging.info("Reputation database connection closed.")
+            logger.info("Reputation database connection closed.")

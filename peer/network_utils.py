@@ -6,7 +6,8 @@ import os
 from typing import Dict, Any, Optional, Tuple
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Network] - %(levelname)s - %(message)s')
+# Get a logger for this specific module
+logger = logging.getLogger(__name__)
 CONFIG_FILE = 'config.yaml'
 
 def load_config():
@@ -21,31 +22,50 @@ def send_message(sock: socket.socket, message: Dict[str, Any]):
     try:
         sock.sendall(json.dumps(message).encode('utf-8'))
     except socket.error as e:
-        logging.error(f"Failed to send message: {e}")
+        logger.error(f"Failed to send message: {e}")
         raise
 
-def receive_message(sock: socket.socket, buffer_size: int) -> Optional[Dict[str, Any]]:
+def receive_json_message(sock: socket.socket, buffer_size: int) -> Optional[Dict[str, Any]]:
     """
-    Receives and deserializes a JSON message.
-    WARNING: This is a simple implementation. It assumes one recv()
-    call will get one complete JSON message and nothing more.
-    It's fine for simple, single-response tracker comms, but
-    not for streaming JSON + raw data.
+    Robsutly receives a complete JSON message, handling large messages
+    that exceed the buffer size.
     """
-    try:
-        data = sock.recv(buffer_size)
-        if not data:
+    buffer = b""
+    json_decoder = json.JSONDecoder()
+    
+    while True:
+        try:
+            # Try to decode the buffer
+            message, index = json_decoder.raw_decode(buffer.decode('utf-8'))
+            # If successful, return the message
+            return message
+        except json.JSONDecodeError:
+            # Not enough data yet, read more
+            try:
+                data = sock.recv(buffer_size)
+                if not data:
+                    logger.warning("Connection closed while receiving message.")
+                    return None
+                buffer += data
+            except socket.timeout:
+                logger.warning("Socket timed out waiting for message.")
+                return None
+            except socket.error as e:
+                logger.error(f"Socket error on recv: {e}")
+                return None
+        except UnicodeDecodeError:
+            # This can happen if buffer is mid-character
+            try:
+                data = sock.recv(1)
+                if not data:
+                    return None
+                buffer += data
+            except socket.error as e:
+                logger.error(f"Socket error on recv (unicode fix): {e}")
+                return None
+        except Exception as e:
+            logger.error(f"Error in receive_json_message: {e}")
             return None
-        return json.loads(data.decode('utf-8'))
-    except json.JSONDecodeError:
-        logging.warning("Received invalid JSON message.")
-        return None
-    except socket.error as e:
-        logging.error(f"Failed to receive message: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Error in receive_message: {e}")
-        return None
 
 # --- Tracker Communication ---
 
@@ -59,10 +79,10 @@ def connect_to_tracker() -> Optional[socket.socket]:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((tracker_host, tracker_port))
         sock.settimeout(10.0) # 10 second timeout
-        logging.info(f"Connected to tracker at {tracker_host}:{tracker_port}")
+        logger.info(f"Connected to tracker at {tracker_host}:{tracker_port}")
         return sock
     except socket.error as e:
-        logging.error(f"Could not connect to tracker: {e}")
+        logger.error(f"Could not connect to tracker: {e}")
         return None
 
 def register_with_tracker(sock: socket.socket, peer_id: str, peer_port: int, files: list) -> Dict[str, Any]:
@@ -76,7 +96,7 @@ def register_with_tracker(sock: socket.socket, peer_id: str, peer_port: int, fil
         }
     }
     send_message(sock, message)
-    response = receive_message(sock, load_config()['tracker']['buffer_size'])
+    response = receive_json_message(sock, load_config()['tracker']['buffer_size'])
     return response or {"status": "error", "message": "No response from tracker"}
 
 def query_tracker_for_file(sock: socket.socket, file_hash: str) -> Dict[str, Any]:
@@ -88,7 +108,7 @@ def query_tracker_for_file(sock: socket.socket, file_hash: str) -> Dict[str, Any
         }
     }
     send_message(sock, message)
-    response = receive_message(sock, load_config()['tracker']['buffer_size'])
+    response = receive_json_message(sock, load_config()['tracker']['buffer_size'])
     return response or {"status": "error", "message": "No response from tracker"}
 
 # --- Peer-to-Peer Communication ---
@@ -100,7 +120,7 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
     Returns:
         The raw chunk data (bytes) if successful, None otherwise.
     """
-    logging.info(f"Requesting chunk {chunk_index} of {file_hash[:10]}... from {peer_addr}")
+    logger.debug(f"Requesting chunk {chunk_index} of {file_hash[:10]}... from {peer_addr}")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(15.0) # 15 second timeout for P2P
@@ -116,83 +136,70 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
             }
             send_message(sock, request_message)
             
-            # -----------------------------------------------------------------
-            # --- START: NEW ROBUST CHUNK RECEIVE LOGIC ---
-            # -----------------------------------------------------------------
-            
             # 2. Receive response header (JSON)
-            # We read raw bytes from the stream until we find the
-            # end of the JSON header (the '}' character).
             buffer = b""
-            raw_data_buffer = b"" # To store any over-read data
+            raw_data_buffer = b""
 
             while True:
+                # Find the end of the JSON object
                 end_json_index = buffer.find(b'}')
                 if end_json_index != -1:
-                    # Found the end of the JSON
                     header_bytes = buffer[:end_json_index + 1]
-                    raw_data_buffer = buffer[end_json_index + 1:]
+                    raw_data_buffer = buffer[end_json_index + 1:] # Store the start of the file data
                     try:
                         response_header = json.loads(header_bytes.decode('utf-8'))
-                        break # We got our header
+                        break # Successfully parsed header
                     except json.JSONDecodeError:
-                        logging.warning(f"Found '}}' but it wasn't valid JSON. Keep reading.")
-                        # This is a rare case, but we continue reading.
+                        # False positive, keep reading
+                        pass 
                 
                 # Read more data
-                data = sock.recv(128) # Read a small chunk
+                data = sock.recv(128) # Read in small bits to find the header
                 if not data:
-                    logging.warning(f"Peer {peer_addr} disconnected while sending header.")
+                    logger.warning(f"Peer {peer_addr} disconnected while sending header.")
                     return None
                 buffer += data
                 
-                # Add a sanity check
-                if len(buffer) > 2048: # 2KB header limit
-                    logging.error(f"Header from {peer_addr} is too large or invalid. Aborting.")
+                # Safety break to prevent infinite loop on bad data
+                if len(buffer) > 2048: # 2KB limit for a header
+                    logger.error(f"Header from {peer_addr} is too large or invalid. Aborting.")
                     return None
             
-            # --- We now have `response_header` (dict) and `raw_data_buffer` (bytes) ---
-
+            # 3. Check Header
             if response_header.get('status') != 'success':
-                logging.warning(f"Peer {peer_addr} returned error: {response_header.get('message')}")
+                logger.warning(f"Peer {peer_addr} returned error: {response_header.get('message')}")
                 return None
 
             chunk_size = response_header.get('chunk_size')
             if chunk_size is None:
-                logging.error(f"Peer {peer_addr} sent invalid success response (missing chunk_size)")
+                logger.error(f"Peer {peer_addr} sent invalid success response (missing chunk_size)")
                 return None
 
-            # 3. Receive the raw chunk data
-            # We start with whatever we over-read from the header
-            chunk_data = raw_data_buffer
+            # 4. Receive the raw chunk data
+            chunk_data = raw_data_buffer # Start with any data we over-read
             bytes_received = len(raw_data_buffer)
-            
-            buffer_size = load_config()['tracker']['buffer_size'] # Get buffer size
+            buffer_size = load_config()['tracker']['buffer_size']
             
             while bytes_received < chunk_size:
                 bytes_to_read = min(buffer_size, chunk_size - bytes_received)
                 data = sock.recv(bytes_to_read)
                 if not data:
-                    logging.error(f"Peer {peer_addr} disconnected before sending full chunk.")
+                    logger.error(f"Peer {peer_addr} disconnected before sending full chunk.")
                     return None
                 chunk_data += data
                 bytes_received += len(data)
             
-            # -----------------------------------------------------------------
-            # --- END: NEW ROBUST CHUNK RECEIVE LOGIC ---
-            # -----------------------------------------------------------------
-            
-            logging.info(f"Successfully received chunk {chunk_index} ({bytes_received} bytes) from {peer_addr}")
+            logger.debug(f"Successfully received chunk {chunk_index} ({bytes_received} bytes) from {peer_addr}")
             return chunk_data
 
     except socket.timeout:
-        logging.warning(f"Connection to peer {peer_addr} timed out.")
+        logger.warning(f"Connection to peer {peer_addr} timed out.")
         return None
     except socket.error as e:
-        logging.error(f"Socket error with peer {peer_addr}: {e}")
+        logger.error(f"Socket error with peer {peer_addr}: {e}")
         return None
     except Exception as e:
-        logging.error(f"Error in request_chunk_from_peer: {e}")
+        logger.error(f"Error in request_chunk_from_peer: {e}")
         return None
 
 def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_manager):
@@ -200,17 +207,16 @@ def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_mana
     Handles an incoming connection from another peer.
     This function is run in a thread by the peer's server.
     """
-    logging.info(f"Handling incoming peer connection from {addr}")
+    logger.info(f"Handling incoming peer connection from {addr}")
     config = load_config()
     buffer_size = config['tracker']['buffer_size']
+    chunk_size = config['peer']['chunk_size'] # <-- Get chunk_size
     
     try:
         # 1. Receive the request message (JSON)
-        # Note: This 'receive_message' is fine because the peer *only*
-        # sends one message (the request) and then waits.
-        message = receive_message(conn, buffer_size)
+        message = receive_json_message(conn, buffer_size)
         if not message:
-            logging.warning(f"No message received from peer {addr}. Closing.")
+            logger.warning(f"No message received from peer {addr}. Closing.")
             return
 
         if message.get('command') != 'request_chunk':
@@ -228,14 +234,11 @@ def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_mana
             send_message(conn, response)
             return
 
-        # 3. Get chunk from storage
-        chunk_path = storage_manager.get_chunk_path(file_hash, chunk_index)
+        # 3. Get chunk data (on-demand)
+        chunk_data = storage_manager.get_chunk_data_for_upload(file_hash, chunk_index, chunk_size)
         
-        if chunk_path and os.path.exists(chunk_path):
+        if chunk_data:
             try:
-                with open(chunk_path, 'rb') as f:
-                    chunk_data = f.read()
-                
                 # 4a. Send success header + raw chunk data
                 response_header = {
                     "status": "success",
@@ -244,22 +247,21 @@ def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_mana
                 send_message(conn, response_header)
                 conn.sendall(chunk_data)
                 
-                logging.info(f"Sent chunk {chunk_index} of {file_hash[:10]}... to {addr}")
-                # TODO: Update reputation for successful upload
+                logger.info(f"Sent chunk {chunk_index} of {file_hash[:10]}... to {addr}")
 
             except IOError as e:
-                logging.error(f"Could not read chunk {chunk_path}: {e}")
+                logger.error(f"Could not read chunk data: {e}")
                 response = {"status": "error", "message": "Internal file read error"}
                 send_message(conn, response)
         else:
             # 4b. Send error message
-            logging.warning(f"Peer {addr} requested chunk {chunk_index} we don't have.")
+            logger.warning(f"Peer {addr} requested chunk {chunk_index} we don't have.")
             response = {"status": "error", "message": "Chunk not found"}
             send_message(conn, response)
 
     except socket.error as e:
-        logging.warning(f"Socket error with peer {addr}: {e}")
+        logger.warning(f"Socket error with peer {addr}: {e}")
     except Exception as e:
-        logging.error(f"Error handling peer {addr}: {e}")
+        logger.error(f"Error handling peer {addr}: {e}")
     finally:
         conn.close()

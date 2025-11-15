@@ -2,40 +2,33 @@ import os
 import json
 import logging
 from typing import Dict, Any, Set, Optional, List
+from peer import file_utils # Import the whole module
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Storage] - %(levelname)s - %(message)s')
+# Get a logger for this specific module
+logger = logging.getLogger(__name__)
 
 class StorageManager:
     """
     Manages the peer's local file storage.
-    
-    Handles:
-    - Shared directory (files to upload)
-    - Downloads directory (incomplete chunks)
-    - Completed directory (reassembled files)
-    - Metadata about file chunks
     """
     def __init__(self, peer_id: str):
         self.peer_id = peer_id
         
         # Define base storage paths
         self.base_dir = f"peer_storage_{self.peer_id}"
-        self.shared_dir = os.path.join(self.base_dir, "shared")
         self.downloads_dir = os.path.join(self.base_dir, "downloads") # For chunks
         self.completed_dir = os.path.join(self.base_dir, "completed")
         self.metadata_file = os.path.join(self.base_dir, "storage_meta.json")
         
         # Create directories
-        os.makedirs(self.shared_dir, exist_ok=True)
         os.makedirs(self.downloads_dir, exist_ok=True)
         os.makedirs(self.completed_dir, exist_ok=True)
         
         # Load or initialize metadata
-        # self.file_metadata -> { "file_hash": { "name": ..., "size": ..., "chunk_count": ... } }
-        # self.chunk_tracker -> { "file_hash": set(chunk_index, ...) }
         self.file_metadata: Dict[str, Dict[str, Any]] = {}
         self.chunk_tracker: Dict[str, Set[int]] = {}
+        self.file_locations: Dict[str, str] = {} # <-- NEW
         self._load_metadata()
 
     def _load_metadata(self):
@@ -45,21 +38,26 @@ class StorageManager:
                 with open(self.metadata_file, 'r') as f:
                     data = json.load(f)
                     self.file_metadata = data.get('file_metadata', {})
+                    self.file_locations = data.get('file_locations', {}) # <-- NEW
                     # Convert lists back to sets
                     chunk_data = data.get('chunk_tracker', {})
                     self.chunk_tracker = {h: set(c) for h, c in chunk_data.items()}
-                logging.info(f"Loaded storage metadata from {self.metadata_file}")
+                logger.info(f"Loaded storage metadata from {self.metadata_file}")
             else:
-                logging.info("No existing metadata file found. Starting fresh and creating one.")
-                self._save_metadata() # <-- This line is new
+                logger.info("No existing metadata file found. Starting fresh and creating one.")
+                self._save_metadata() # Create empty file
         except json.JSONDecodeError:
-            logging.error(f"Error decoding metadata file. Starting fresh.")
-            self.file_metadata = {}
-            self.chunk_tracker = {}
+            logger.error(f"Error decoding metadata file. Starting fresh.")
+            self._reset_metadata()
         except Exception as e:
-            logging.error(f"Error loading metadata: {e}")
-            self.file_metadata = {}
-            self.chunk_tracker = {}
+            logger.error(f"Error loading metadata: {e}")
+            self._reset_metadata()
+
+    def _reset_metadata(self):
+        """Resets metadata to a clean state."""
+        self.file_metadata = {}
+        self.chunk_tracker = {}
+        self.file_locations = {}
 
     def _save_metadata(self):
         """Saves the current file metadata and chunk tracker to disk."""
@@ -69,45 +67,42 @@ class StorageManager:
                 chunk_data = {h: list(c) for h, c in self.chunk_tracker.items()}
                 data = {
                     'file_metadata': self.file_metadata,
-                    'chunk_tracker': chunk_data
+                    'chunk_tracker': chunk_data,
+                    'file_locations': self.file_locations # <-- NEW
                 }
                 json.dump(data, f, indent=4)
         except IOError as e:
-            logging.error(f"Could not save metadata to {self.metadata_file}: {e}")
+            logger.error(f"Could not save metadata to {self.metadata_file}: {e}")
 
     def add_file_to_share(self, file_path: str, chunk_size: int) -> Optional[Dict[str, Any]]:
         """
-        Adds a new file to the shared directory, splits it into chunks,
-        and tracks its metadata.
+        Analyzes a file for sharing (On-Demand).
+        Does NOT copy or split the file, just calculates metadata.
         """
-        # We need file_utils for this
-        from peer.file_utils import split_file, get_file_hash
-        
-        # 1. Copy file to shared directory
-        file_name = os.path.basename(file_path)
-        shared_file_path = os.path.join(self.shared_dir, file_name)
-        try:
-            if not os.path.exists(shared_file_path):
-                 # Simple copy, replace with move or symbolic link for efficiency
-                import shutil
-                shutil.copy(file_path, shared_file_path)
-        except IOError as e:
-            logging.error(f"Failed to copy file to shared dir: {e}")
+        # 1. Get absolute path to store as a pointer
+        abs_file_path = os.path.abspath(file_path)
+        if not os.path.exists(abs_file_path):
+            logger.error(f"File not found: {file_path}")
             return None
             
-        # 2. Split file into chunks in the downloads dir (so we can serve them)
-        file_meta = split_file(shared_file_path, chunk_size, self.downloads_dir)
+        # 2. Get all metadata (hashes) from the file
+        file_meta = file_utils.get_file_metadata(abs_file_path, chunk_size)
         
         if file_meta:
             file_hash = file_meta['hash']
             self.file_metadata[file_hash] = file_meta
-            # We have all chunks
+            
+            # 3. Store the *location* of the original file
+            self.file_locations[file_hash] = abs_file_path
+            
+            # 4. We "own" all chunks of this file
             self.chunk_tracker[file_hash] = set(range(file_meta['chunk_count']))
+            
             self._save_metadata()
-            logging.info(f"Added file '{file_name}' (hash: {file_hash[:10]}...) to storage.")
+            logger.info(f"Now sharing '{file_meta['name']}' from {abs_file_path}")
             return file_meta
         else:
-            logging.error(f"Failed to split and process file: {file_name}")
+            logger.error(f"Failed to get metadata for file: {file_path}")
             return None
 
     def get_shared_files_info(self) -> List[Dict[str, Any]]:
@@ -122,15 +117,16 @@ class StorageManager:
         if file_hash not in self.file_metadata:
             self.file_metadata[file_hash] = file_meta
             self.chunk_tracker[file_hash] = set() # We have no chunks yet
+            # Note: We do NOT add this to self.file_locations
             self._save_metadata()
-            logging.info(f"Added new download target: {file_meta['name']} (hash: {file_hash[:10]}...)")
+            logger.info(f"Added new download target: {file_meta['name']} (hash: {file_hash[:10]}...)")
         else:
-            logging.info(f"Already tracking file: {file_meta['name']}")
+            logger.info(f"Already tracking file: {file_meta['name']}")
 
     def store_chunk(self, file_hash: str, chunk_index: int, chunk_data: bytes) -> bool:
         """Saves a received chunk to the downloads directory."""
         if file_hash not in self.file_metadata:
-            logging.warning(f"Received chunk for untracked file hash: {file_hash}")
+            logger.warning(f"Received chunk for untracked file hash: {file_hash}")
             return False
         
         chunk_filename = f"{file_hash}.{chunk_index}"
@@ -143,19 +139,40 @@ class StorageManager:
             # Update tracker
             self.chunk_tracker[file_hash].add(chunk_index)
             self._save_metadata()
-            logging.debug(f"Stored chunk {chunk_index} for file {file_hash[:10]}...")
+            logger.debug(f"Stored chunk {chunk_index} for file {file_hash[:10]}...")
             return True
         except IOError as e:
-            logging.error(f"Failed to write chunk {chunk_path}: {e}")
+            logger.error(f"Failed to write chunk {chunk_path}: {e}")
             return False
 
-    def get_chunk_path(self, file_hash: str, chunk_index: int) -> Optional[str]:
-        """Gets the file path for a requested chunk, if we have it."""
-        if self.has_chunk(file_hash, chunk_index):
-            chunk_filename = f"{file_hash}.{chunk_index}"
-            return os.path.join(self.downloads_dir, chunk_filename)
-        logging.debug(f"Chunk {chunk_index} for file {file_hash[:10]}... not found.")
-        return None
+    def get_chunk_data_for_upload(self, file_hash: str, chunk_index: int, chunk_size: int) -> Optional[bytes]:
+        """
+        Gets the raw data for a chunk, either from the original file
+        (if we're the seeder) or from our downloaded chunks.
+        """
+        if not self.has_chunk(file_hash, chunk_index):
+            logger.warning(f"Upload requested for chunk {chunk_index} of {file_hash[:10]}, but we don't have it.")
+            return None
+
+        # Case 1: We are the original seeder. Read from original file path.
+        if file_hash in self.file_locations:
+            original_path = self.file_locations[file_hash]
+            return file_utils.read_chunk_from_file(original_path, chunk_index, chunk_size)
+        
+        # Case 2: We are a leecher-turned-seeder. Read from /downloads.
+        chunk_filename = f"{file_hash}.{chunk_index}"
+        chunk_path = os.path.join(self.downloads_dir, chunk_filename)
+        
+        if os.path.exists(chunk_path):
+            try:
+                with open(chunk_path, 'rb') as f:
+                    return f.read()
+            except IOError as e:
+                logger.error(f"Error reading owned chunk {chunk_path}: {e}")
+                return None
+        else:
+            logger.error(f"Chunk {chunk_index} in tracker but not found at {chunk_path}.")
+            return None
 
     def has_chunk(self, file_hash: str, chunk_index: int) -> bool:
         """Checks if we have a specific chunk."""

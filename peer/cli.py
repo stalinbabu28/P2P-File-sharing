@@ -8,10 +8,18 @@ import os
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 
+# Import peer *after* path is set
 from peer.peer import Peer
 
 # --- Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - [CLI] - %(levelname)s - %(message)s')
+# THIS IS THE *ONLY* basicConfig IN THE ENTIRE APPLICATION
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [%(name)s] - %(levelname)s - %(message)s'
+)
+# Get a logger for this specific module
+logger = logging.getLogger(__name__)
+
 
 def main():
     parser = argparse.ArgumentParser(description="P2P File Sharing Peer")
@@ -36,35 +44,34 @@ def main():
         peer = Peer()
         peer.start_server()
         
-        # --- NEW: Start persistent tracker connection ---
         peer.start_tracker_connection()
         
         # Always register, even if just running as a daemon
         peer.register_with_tracker()
 
         if args.command == 'share':
-            logging.info(f"CLI: Executing 'share' command for {args.file_path}")
+            logger.info(f"CLI: Executing 'share' command for {args.file_path}")
             peer.share_file(args.file_path)
-            logging.info("Share command complete. Peer will continue running as a daemon.")
+            logger.info("Share command complete. Peer will continue running as a daemon.")
             
         elif args.command == 'download':
-            logging.info(f"CLI: Executing 'download' command for {args.file_hash}")
+            logger.info(f"CLI: Executing 'download' command for {args.file_hash}")
             peer.download_file(args.file_hash)
-            logging.info("Download command complete. Peer will continue running as a daemon.")
+            logger.info("Download command complete. Peer will continue running as a daemon.")
             
         elif args.command == 'daemon':
-            logging.info("CLI: Running in daemon mode. Seeding files...")
+            logger.info("CLI: Running in daemon mode. Seeding files...")
 
         # Keep the main thread alive to let the server thread run
         while True:
             time.sleep(1)
             
     except KeyboardInterrupt:
-        logging.info("CLI: Shutdown signal received.")
+        logger.info("CLI: Shutdown signal received.")
     finally:
         if 'peer' in locals():
             peer.stop()
-        logging.info("CLI: Exiting.")
+        logger.info("CLI: Exiting.")
 
 if __name__ == "__main__":
     main()

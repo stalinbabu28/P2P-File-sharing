@@ -3,7 +3,7 @@ import threading
 import json
 import yaml
 import logging
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, Tuple , Optional
 
 # --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Tracker] - %(levelname)s - %(message)s')
@@ -32,6 +32,41 @@ peer_registry: Dict[str, Tuple[str, int]] = {}
 # Locks to ensure thread-safety when modifying global state
 index_lock = threading.Lock()
 peer_lock = threading.Lock()
+
+
+# --- NEW ROBUST RECEIVE FUNCTION ---
+def receive_json_message(conn: socket.socket, buffer_size: int) -> Optional[Dict[str, Any]]:
+    """
+    Robsutly receives a complete JSON message, handling large messages
+    that exceed the buffer size.
+    """
+    buffer = b""
+    json_decoder = json.JSONDecoder()
+    
+    while True:
+        try:
+            # Try to decode the buffer
+            message, index = json_decoder.raw_decode(buffer.decode('utf-8'))
+            # If successful, return the message and clear the buffer
+            # (or handle multiple messages if we wanted)
+            return message
+        except json.JSONDecodeError:
+            # Not enough data yet, read more
+            data = conn.recv(buffer_size)
+            if not data:
+                logging.warning("Connection closed while receiving message.")
+                return None
+            buffer += data
+        except UnicodeDecodeError:
+            # This can happen if buffer is mid-character
+            data = conn.recv(1)
+            if not data:
+                return None
+            buffer += data
+        except Exception as e:
+            logging.error(f"Error in receive_json_message: {e}")
+            return None
+
 
 # --- Tracker Logic ---
 
@@ -93,13 +128,6 @@ def handle_query_file(payload: Dict[str, Any]) -> Dict[str, Any]:
             file_info = file_index[file_hash]
             peer_ids = file_info["peers"]
             
-            # --- Reputation Matching (Future Stub) ---
-            # This is where we would implement the logic:
-            # 1. Get the requesting peer's reputation (requester_rep = get_reputation(payload['peer_id']))
-            # 2. Get reputations for all peers in `peer_ids`
-            # 3. Sort/filter `peer_ids` based on reputation similarity
-            # For now, we return all peers.
-            
             found_peers = []
             with peer_lock:
                 for peer_id in peer_ids:
@@ -140,12 +168,10 @@ def handle_deregister(peer_id: str):
                 logging.info(f"Deregistered peer {peer_id}")
 
         with index_lock:
-            # This is slow, but simple. A proper DB would be faster.
             files_to_prune = []
             for file_hash, file_data in file_index.items():
                 if peer_id in file_data["peers"]:
                     file_data["peers"].remove(peer_id)
-                # If no peers have this file anymore, remove it from index
                 if not file_data["peers"]:
                     files_to_prune.append(file_hash)
             
@@ -170,51 +196,39 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]):
     peer_id = None # Track which peer this connection belongs to
     
     try:
+        # --- MODIFIED RECEIVE LOOP ---
         while True:
-            data = conn.recv(buffer_size)
-            if not data:
-                logging.info(f"Connection from {client_ip}:{client_port} closed.")
+            # Use the new robust receive function
+            message = receive_json_message(conn, buffer_size)
+            
+            if not message:
+                # Client disconnected or sent invalid data
+                logging.info(f"Connection from {client_ip}:{client_port} closed or invalid data.")
                 break
             
-            # Assume messages are JSON strings, separated by newlines
-            # This is a simple protocol; real-world might use length prefixing
-            try:
-                message = json.loads(data.decode('utf-8'))
-                logging.debug(f"Received message: {message}")
-                
-                command = message.get('command')
-                payload = message.get('payload', {})
-                
-                # Snag peer_id from payloads that have it
-                if 'peer_id' in payload:
-                    peer_id = payload['peer_id']
+            logging.debug(f"Received message: {message}")
+            
+            command = message.get('command')
+            payload = message.get('payload', {})
+            
+            if 'peer_id' in payload:
+                peer_id = payload['peer_id']
 
-                response = {}
-                if command == 'register':
-                    response = handle_register(payload, client_ip)
-                elif command == 'query_file':
-                    response = handle_query_file(payload)
-                # 'update_reputation' would be handled by peers, not the tracker,
-                # based on the PDF (decentralized reputation).
-                else:
-                    response = {"status": "error", "message": "Unknown command"}
-                
-                # Send response back to peer
-                conn.sendall(json.dumps(response).encode('utf-8'))
+            response = {}
+            if command == 'register':
+                response = handle_register(payload, client_ip)
+            elif command == 'query_file':
+                response = handle_query_file(payload)
+            else:
+                response = {"status": "error", "message": "Unknown command"}
+            
+            # Send response back to peer
+            conn.sendall(json.dumps(response).encode('utf-8'))
 
-            except json.JSONDecodeError:
-                logging.warning(f"Received invalid JSON from {client_ip}:{client_port}")
-                conn.sendall(json.dumps({"status": "error", "message": "Invalid JSON"}).encode('utf-8'))
-            except Exception as e:
-                logging.error(f"Error handling message: {e}")
-                conn.sendall(json.dumps({"status": "error", "message": "Internal server error"}).encode('utf-8'))
-    
     except socket.error as e:
         logging.warning(f"Socket error with {client_ip}:{client_port}: {e}")
     finally:
-        # Client disconnected
         if peer_id:
-            # If the peer ever registered, deregister it
             handle_deregister(peer_id)
         conn.close()
         logging.info(f"Closed connection from {client_ip}:{client_port}")
@@ -236,9 +250,8 @@ def main():
             
             while True:
                 conn, addr = server_socket.accept()
-                # Start a new thread for each client
                 thread = threading.Thread(target=handle_client, args=(conn, addr))
-                thread.daemon = True # Allows program to exit even if threads are running
+                thread.daemon = True
                 thread.start()
                 
     except OSError as e:
