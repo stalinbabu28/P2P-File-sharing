@@ -91,7 +91,7 @@ def split_file(file_path: str, chunk_size: int, output_dir: str) -> Optional[Dic
             "size": file_size,
             "hash": file_hash,
             "chunk_count": chunk_count,
-            "chunk_hashes": chunk_hashes
+            "chunk_hashes": chunk_hashes # <-- RETURN CHUNK HASHES
         }
     except IOError as e:
         logging.error(f"Error splitting file {file_path}: {e}")
@@ -126,17 +126,25 @@ def reassemble_file(file_hash: str, chunk_count: int, chunks_dir: str, output_pa
         logging.error(f"An unexpected error occurred in reassemble_file: {e}")
         return False
 
+# --- NEW FUNCTION ---
+def verify_chunk_data(chunk_data: bytes, expected_hash: str) -> bool:
+    """Verifies the integrity of a single chunk's raw data."""
+    try:
+        actual_hash = hashlib.sha256(chunk_data).hexdigest()
+        is_valid = actual_hash == expected_hash
+        if not is_valid:
+            logging.warning(f"Chunk integrity check FAILED. Expected {expected_hash}, got {actual_hash}")
+        return is_valid
+    except Exception as e:
+        logging.error(f"Error verifying chunk data: {e}")
+        return False
+
 def verify_chunk(chunk_path: str, expected_hash: str) -> bool:
     """Verifies the integrity of a single file chunk."""
     try:
         with open(chunk_path, 'rb') as f:
             chunk_data = f.read()
-            actual_hash = hashlib.sha256(chunk_data).hexdigest()
-        
-        is_valid = actual_hash == expected_hash
-        if not is_valid:
-            logging.warning(f"Chunk integrity check FAILED for {chunk_path}. Expected {expected_hash}, got {actual_hash}")
-        return is_valid
+            return verify_chunk_data(chunk_data, expected_hash)
     except IOError as e:
         logging.error(f"Could not read chunk {chunk_path} for verification: {e}")
         return False

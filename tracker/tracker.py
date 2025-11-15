@@ -23,10 +23,7 @@ def load_config():
         exit(1)
 
 # --- Global State (Thread-Safe) ---
-# We use dictionaries to store the state. For a larger application,
-# this would be moved to tracker_db.py and use SQLite.
-
-# file_index -> {"file_hash": {"name": "...", "size": ..., "chunk_count": ..., "peers": set()}}
+# file_index -> {"file_hash": {"name": "...", "size": ..., "chunk_count": ..., "chunk_hashes": [...], "peers": set()}}
 file_index: Dict[str, Dict[str, Any]] = {}
 
 # peer_registry -> {"peer_id": ("ip", port)}
@@ -46,7 +43,7 @@ def handle_register(payload: Dict[str, Any], client_ip: str) -> Dict[str, Any]:
     try:
         peer_id = payload['peer_id']
         peer_port = payload['port']
-        files = payload['files'] # List of {"hash": "...", "name": "...", "size": ..., "chunk_count": ...}
+        files = payload['files'] # List of {"hash": "...", "name": "...", "size": ..., "chunk_count": ..., "chunk_hashes": [...]}
         
         peer_addr = (client_ip, peer_port)
 
@@ -63,6 +60,7 @@ def handle_register(payload: Dict[str, Any], client_ip: str) -> Dict[str, Any]:
                         "name": file_info['name'],
                         "size": file_info['size'],
                         "chunk_count": file_info['chunk_count'],
+                        "chunk_hashes": file_info['chunk_hashes'], # <-- STORE CHUNK HASHES
                         "peers": set()
                     }
                 # Add this peer to the set of peers for this file
@@ -118,6 +116,7 @@ def handle_query_file(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "file_name": file_info["name"],
                 "file_size": file_info["size"],
                 "chunk_count": file_info["chunk_count"],
+                "chunk_hashes": file_info["chunk_hashes"], # <-- SEND CHUNK HASHES
                 "peers": found_peers
             }
             return response

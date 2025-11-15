@@ -181,8 +181,14 @@ class Peer:
             "size": response.get('file_size'),
             "hash": file_hash,
             "chunk_count": response.get('chunk_count'),
-            "chunk_hashes": response.get('chunk_hashes', []) # TODO: Tracker should send this
+            "chunk_hashes": response.get('chunk_hashes', []) # <-- GET CHUNK HASHES
         }
+        
+        # --- CHECK: Ensure we got chunk hashes ---
+        if not file_meta["chunk_hashes"] or len(file_meta["chunk_hashes"]) != file_meta["chunk_count"]:
+            logging.error("Tracker did not return valid chunk hash information. Aborting.")
+            return
+
         self.storage.add_downloading_file(file_meta)
         
         peer_list = response.get('peers', [])
@@ -194,14 +200,12 @@ class Peer:
         peer_ids = [p['id'] for p in peer_list]
         sorted_peers_with_score = self.reputation.get_peers_sorted_by_reputation(peer_ids)
         
-        # Create a map of id -> (ip, port)
         peer_addr_map = {p['id']: (p['ip'], p['port']) for p in peer_list}
         
-        # Create the final sorted list of addresses
         sorted_peer_addrs = []
         for peer_id, score in sorted_peers_with_score:
             if peer_id in peer_addr_map:
-                sorted_peer_addrs.append(peer_addr_map[peer_id])
+                sorted_peer_addrs.append( (peer_id, peer_addr_map[peer_id]) ) # Store (id, addr) tuple
         
         logging.info(f"Found {len(sorted_peer_addrs)} peers. Sorted by reputation:")
         for i, (peer_id, score) in enumerate(sorted_peers_with_score):
@@ -213,42 +217,53 @@ class Peer:
         
         for chunk_index in missing_chunks:
             chunk_data = None
-            for peer_addr in sorted_peer_addrs:
-                # TODO: We don't have peer_id here, only addr.
-                # This is a flaw in the current design. We should use peer_id
-                # and get the addr from the map.
-                # For now, we just try in order.
+            # --- MODIFIED: Loop includes peer_id now ---
+            for peer_id_for_rep, peer_addr in sorted_peer_addrs:
                 
-                # Get peer_id from addr for reputation update
-                peer_id_for_rep = next((pid for pid, addr in peer_addr_map.items() if addr == peer_addr), None)
+                # Skip downloading from ourselves
+                if peer_id_for_rep == self.peer_id:
+                    continue
 
                 try:
                     chunk_data = network_utils.request_chunk_from_peer(peer_addr, file_hash, chunk_index)
                     
                     if chunk_data:
-                        # 4a. Verify Chunk (TODO: use chunk_hashes)
-                        # For now, we assume it's good. We'll verify the whole file at the end.
-                        # A better way: `file_utils.verify_chunk(data, file_meta['chunk_hashes'][chunk_index])`
+                        # -----------------------------------------------------------------
+                        # --- START: NEW VERIFICATION & REPUTATION LOGIC ---
+                        # -----------------------------------------------------------------
                         
-                        # 4b. Store Chunk
-                        self.storage.store_chunk(file_hash, chunk_index, chunk_data)
+                        expected_hash = file_meta['chunk_hashes'][chunk_index]
                         
-                        # 4c. Update Reputation (GOOD)
-                        if peer_id_for_rep:
+                        if file_utils.verify_chunk_data(chunk_data, expected_hash):
+                            # Chunk is good!
+                            logging.info(f"Chunk {chunk_index} integrity VERIFIED.")
+                            self.storage.store_chunk(file_hash, chunk_index, chunk_data)
+                            
+                            # Update reputation for good download + integrity
                             self.reputation.update_reputation(peer_id_for_rep, "SUCCESSFUL_DOWNLOAD")
+                            self.reputation.update_reputation(peer_id_for_rep, "VERIFIED_INTEGRITY")
+                            
+                            logging.info(f"Successfully downloaded chunk {chunk_index} from {peer_addr}")
+                            break # Move to the next chunk
+                        else:
+                            # Chunk is corrupt!
+                            logging.warning(f"Chunk {chunk_index} from {peer_addr} is CORRUPT. Discarding.")
+                            self.reputation.update_reputation(peer_id_for_rep, "CORRUPTED_DATA")
+                            # Set chunk_data to None so we fall through and try the next peer
+                            chunk_data = None 
+                            continue # Try this chunk again with the next peer
                         
-                        logging.info(f"Successfully downloaded chunk {chunk_index} from {peer_addr}")
-                        break # Move to the next chunk
+                        # -----------------------------------------------------------------
+                        # --- END: NEW VERIFICATION & REPUTATION LOGIC ---
+                        # -----------------------------------------------------------------
                     else:
-                        # 4d. Update Reputation (BAD - Refused/Error)
-                        if peer_id_for_rep:
-                            self.reputation.update_reputation(peer_id_for_rep, "REFUSED_UPLOAD")
+                        # Peer refused or had error
+                        self.reputation.update_reputation(peer_id_for_rep, "REFUSED_UPLOAD")
                         logging.warning(f"Failed to get chunk {chunk_index} from {peer_addr}. Trying next peer.")
                 
                 except Exception as e:
-                    # 4e. Update Reputation (BAD - Timeout)
-                    if peer_id_for_rep:
-                        self.reputation.update_reputation(peer_id_for_rep, "CONNECTION_TIMEOUT")
+                    # Peer timed out
+                    self.reputation.update_reputation(peer_id_for_rep, "CONNECTION_TIMEOUT")
                     logging.warning(f"Error connecting to {peer_addr}: {e}. Trying next peer.")
 
             if not chunk_data:

@@ -117,38 +117,42 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
             send_message(sock, request_message)
             
             # -----------------------------------------------------------------
-            # --- START: MODIFIED CHUNK RECEIVE LOGIC ---
+            # --- START: NEW ROBUST CHUNK RECEIVE LOGIC ---
             # -----------------------------------------------------------------
             
             # 2. Receive response header (JSON)
-            # We read from the stream until we can parse a complete JSON object.
-            # This is robust against TCP bundling the JSON and raw data.
+            # We read raw bytes from the stream until we find the
+            # end of the JSON header (the '}' character).
             buffer = b""
             raw_data_buffer = b"" # To store any over-read data
-            json_decoder = json.JSONDecoder()
 
             while True:
-                try:
-                    # Try to decode the buffer
-                    response_header, index = json_decoder.raw_decode(buffer.decode('utf-8'))
-                    # If successful, store the remainder (start of raw chunk)
-                    raw_data_buffer = buffer[index:]
-                    break # We got our header
-                except json.JSONDecodeError:
-                    # Not enough data yet, read more
-                    data = sock.recv(128) # Read a small chunk
-                    if not data:
-                        logging.warning(f"Peer {peer_addr} disconnected while sending header.")
-                        return None
-                    buffer += data
-                except UnicodeDecodeError:
-                    # This can happen if buffer is mid-character
-                    data = sock.recv(1)
-                    if not data:
-                        logging.warning(f"Peer {peer_addr} disconnected on unicode error.")
-                        return None
-                    buffer += data
+                end_json_index = buffer.find(b'}')
+                if end_json_index != -1:
+                    # Found the end of the JSON
+                    header_bytes = buffer[:end_json_index + 1]
+                    raw_data_buffer = buffer[end_json_index + 1:]
+                    try:
+                        response_header = json.loads(header_bytes.decode('utf-8'))
+                        break # We got our header
+                    except json.JSONDecodeError:
+                        logging.warning(f"Found '}}' but it wasn't valid JSON. Keep reading.")
+                        # This is a rare case, but we continue reading.
                 
+                # Read more data
+                data = sock.recv(128) # Read a small chunk
+                if not data:
+                    logging.warning(f"Peer {peer_addr} disconnected while sending header.")
+                    return None
+                buffer += data
+                
+                # Add a sanity check
+                if len(buffer) > 2048: # 2KB header limit
+                    logging.error(f"Header from {peer_addr} is too large or invalid. Aborting.")
+                    return None
+            
+            # --- We now have `response_header` (dict) and `raw_data_buffer` (bytes) ---
+
             if response_header.get('status') != 'success':
                 logging.warning(f"Peer {peer_addr} returned error: {response_header.get('message')}")
                 return None
@@ -175,7 +179,7 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
                 bytes_received += len(data)
             
             # -----------------------------------------------------------------
-            # --- END: MODIFIED CHUNK RECEIVE LOGIC ---
+            # --- END: NEW ROBUST CHUNK RECEIVE LOGIC ---
             # -----------------------------------------------------------------
             
             logging.info(f"Successfully received chunk {chunk_index} ({bytes_received} bytes) from {peer_addr}")
@@ -202,6 +206,8 @@ def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_mana
     
     try:
         # 1. Receive the request message (JSON)
+        # Note: This 'receive_message' is fine because the peer *only*
+        # sends one message (the request) and then waits.
         message = receive_message(conn, buffer_size)
         if not message:
             logging.warning(f"No message received from peer {addr}. Closing.")
@@ -240,9 +246,6 @@ def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_mana
                 
                 logging.info(f"Sent chunk {chunk_index} of {file_hash[:10]}... to {addr}")
                 # TODO: Update reputation for successful upload
-                # This is tricky because we don't know the peer_id, only IP/port
-                # We would need to pass the reputation_manager here and
-                # do a reverse lookup (ip:port -> peer_id)
 
             except IOError as e:
                 logging.error(f"Could not read chunk {chunk_path}: {e}")
