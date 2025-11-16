@@ -3,24 +3,20 @@ import logging
 import os
 from typing import List, Tuple, Optional
 
-# --- Configuration ---
-# Get a logger for this specific module
 logger = logging.getLogger(__name__)
 
-# --- Reputation Update Rules (from PDF, Page 6) ---
 REPUTATION_RULES = {
     "SUCCESSFUL_UPLOAD": 3,
-    "SUCCESSFUL_DOWNLOAD": 3, # My addition, seems logical
+    "SUCCESSFUL_DOWNLOAD": 3,
     "VERIFIED_INTEGRITY": 2,
     "CONNECTION_TIMEOUT": -1,
     "REFUSED_UPLOAD": -3,
     "CORRUPTED_DATA": -5
 }
 
-# --- Reputation Formula (from PDF, Page 6) ---
-ALPHA = 0.8 # Weight for old reputation
-BETA = 0.2  # Weight for new interaction
-DEFAULT_REPUTATION = 10 # Starting reputation for unknown peers
+ALPHA = 0.8 
+BETA = 0.2 
+DEFAULT_REPUTATION = 10
 
 class ReputationManager:
     """
@@ -29,10 +25,8 @@ class ReputationManager:
     """
     def __init__(self, peer_id: str):
         self.peer_id = peer_id
-        # Each peer gets its own private database file
         self.db_path = f"peer_storage_{self.peer_id}/reputation.db"
         
-        # Ensure the directory exists
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         
         self.conn = self._init_db()
@@ -42,7 +36,7 @@ class ReputationManager:
     def _init_db(self) -> Optional[sqlite3.Connection]:
         """Initializes the SQLite database and 'reputation' table."""
         try:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False) # Allow access from different threads
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             
             # Table: reputation
@@ -76,11 +70,10 @@ class ReputationManager:
             if result:
                 return float(result[0])
             else:
-                # Peer not in DB, return default score
                 return DEFAULT_REPUTATION
         except sqlite3.Error as e:
             logger.error(f"Error getting reputation for {peer_id}: {e}")
-            return DEFAULT_REPUTATION # Return default on error
+            return DEFAULT_REPUTATION 
 
     def update_reputation(self, peer_id: str, event_type: str):
         """
@@ -98,7 +91,6 @@ class ReputationManager:
         try:
             cursor = self.conn.cursor()
             
-            # Get current score and interactions
             cursor.execute("SELECT score, interactions FROM reputation WHERE peer_id = ?", (peer_id,))
             result = cursor.fetchone()
             
@@ -107,14 +99,11 @@ class ReputationManager:
                 old_score = float(old_score)
                 interactions = int(interactions)
             else:
-                # First interaction
                 old_score = DEFAULT_REPUTATION
                 interactions = 0
             
-            # Apply the formula from the PDF
             new_score = (ALPHA * old_score) + (BETA * delta_r)
             
-            # Update the database
             cursor.execute('''
                 INSERT INTO reputation (peer_id, score, interactions)
                 VALUES (?, ?, ?)
@@ -125,7 +114,6 @@ class ReputationManager:
             
             self.conn.commit()
             
-            # Changed from logging.INFO to logging.DEBUG for clean tqdm
             logger.debug(f"Updated reputation for {peer_id}: {old_score:.2f} -> {new_score:.2f} (Event: {event_type})")
             
         except sqlite3.Error as e:
@@ -137,7 +125,6 @@ class ReputationManager:
         from highest reputation to lowest.
         """
         if self.conn is None:
-            # Return list with default scores if DB fails
             return [(peer_id, DEFAULT_REPUTATION) for peer_id in peer_ids]
 
         try:
@@ -145,14 +132,12 @@ class ReputationManager:
             for peer_id in peer_ids:
                 peer_scores.append((peer_id, self.get_reputation(peer_id)))
             
-            # Sort the list by score (index 1), descending
             peer_scores.sort(key=lambda x: x[1], reverse=True)
             
             return peer_scores
             
         except Exception as e:
             logger.error(f"Error sorting peers by reputation: {e}")
-            # Fallback
             return [(peer_id, DEFAULT_REPUTATION) for peer_id in peer_ids]
     
     def close(self):

@@ -6,15 +6,13 @@ import time
 import os
 import yaml
 from typing import Dict, Any, Optional
-from tqdm import tqdm # <-- Import tqdm
+from tqdm import tqdm
 
 from peer.storage import StorageManager
 from peer.reputation import ReputationManager
 from peer import file_utils
 from peer import network_utils
 
-# --- Configuration ---
-# Get a logger for this specific module
 logger = logging.getLogger(__name__)
 CONFIG_FILE = 'config.yaml'
 
@@ -23,13 +21,11 @@ class Peer:
         self.peer_id: str = f"peer_{uuid.uuid4().hex[:8]}"
         self.config = self._load_config()
         
-        # Initialize helper modules
         self.storage: StorageManager = StorageManager(self.peer_id)
         self.reputation: ReputationManager = ReputationManager(self.peer_id)
         
-        # Peer server setup
         self.server_port: int = self._get_free_port()
-        self.server_host: str = "127.0.0.1" # Listen on localhost
+        self.server_host: str = "127.0.0.1" 
         self.server_thread: Optional[threading.Thread] = None
         self.is_running: bool = True
         
@@ -51,8 +47,8 @@ class Peer:
     def _get_free_port(self) -> int:
         """Finds and returns an available port on the system."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0)) # Bind to port 0 to let OS pick
-            return s.getsockname()[1] # Return the chosen port
+            s.bind(('', 0)) 
+            return s.getsockname()[1]
 
     def start_server(self):
         """Starts the P2P server in a new thread to listen for other peers."""
@@ -70,11 +66,9 @@ class Peer:
                 
                 while self.is_running:
                     try:
-                        # Set a timeout so the loop can check `self.is_running`
                         server_socket.settimeout(1.0)
                         conn, addr = server_socket.accept()
                         
-                        # Handle the peer connection in a new thread
                         handler_thread = threading.Thread(
                             target=network_utils.handle_peer_request,
                             args=(conn, addr, self.storage),
@@ -82,7 +76,7 @@ class Peer:
                         )
                         handler_thread.start()
                     except socket.timeout:
-                        continue # Go back to check `self.is_running`
+                        continue
                     
         except OSError as e:
             if self.is_running:
@@ -122,7 +116,6 @@ class Peer:
             else:
                 logger.warning(f"Tracker registration failed: {response.get('message')}")
         except Exception as e:
-            # If send fails, close socket and set to None so we can retry
             logger.error(f"Error communicating with tracker: {e}. Closing connection.")
             if self.tracker_sock:
                 self.tracker_sock.close()
@@ -140,7 +133,6 @@ class Peer:
         
         if file_meta:
             logger.info(f"File '{file_meta['name']}' processed. Hash: {file_meta['hash']}")
-            # Re-register with tracker to announce the new file
             self.register_with_tracker()
         else:
             logger.error(f"Failed to process and share file: {file_path}")
@@ -149,7 +141,6 @@ class Peer:
         """Main file download logic."""
         logger.info(f"Attempting to download file: {file_hash[:10]}...")
         
-        # 1. Query Tracker
         if not self.tracker_sock:
             logger.warning("No tracker connection. Attempting to reconnect...")
             self.start_tracker_connection()
@@ -164,13 +155,12 @@ class Peer:
             if self.tracker_sock:
                 self.tracker_sock.close()
             self.tracker_sock = None
-            return # Abort download
+            return 
             
         if response.get('status') != 'success':
             logger.error(f"Tracker query failed: {response.get('message')}")
             return
             
-        # 2. Process Tracker Response
         file_meta = {
             "name": response.get('file_name'),
             "size": response.get('file_size'),
@@ -190,7 +180,6 @@ class Peer:
             logger.warning("File found, but no peers are currently sharing it.")
             return
 
-        # 3. Sort Peers by Reputation
         peer_ids = [p['id'] for p in peer_list]
         sorted_peers_with_score = self.reputation.get_peers_sorted_by_reputation(peer_ids)
         
@@ -199,13 +188,12 @@ class Peer:
         sorted_peer_addrs = []
         for peer_id, score in sorted_peers_with_score:
             if peer_id in peer_addr_map:
-                sorted_peer_addrs.append( (peer_id, peer_addr_map[peer_id]) ) # Store (id, addr) tuple
+                sorted_peer_addrs.append( (peer_id, peer_addr_map[peer_id]) )
         
         logger.info(f"Found {len(sorted_peer_addrs)} peers. Sorted by reputation:")
         for i, (peer_id, score) in enumerate(sorted_peers_with_score):
             logger.info(f"  {i+1}. {peer_id} (Score: {score:.2f}) at {peer_addr_map.get(peer_id)}")
 
-        # 4. Download Loop
         missing_chunks = list(self.storage.get_missing_chunks(file_hash))
         owned_chunks_count = file_meta['chunk_count'] - len(missing_chunks)
         logger.info(f"Need to download {len(missing_chunks)} chunks...")
@@ -220,7 +208,6 @@ class Peer:
             chunk_data = None
             for peer_id_for_rep, peer_addr in sorted_peer_addrs:
                 
-                # Skip downloading from ourselves
                 if peer_id_for_rep == self.peer_id:
                     continue
 
@@ -231,36 +218,30 @@ class Peer:
                         expected_hash = file_meta['chunk_hashes'][chunk_index]
                         
                         if file_utils.verify_chunk_data(chunk_data, expected_hash):
-                            # Chunk is good!
                             logger.debug(f"Chunk {chunk_index} integrity VERIFIED.")
                             self.storage.store_chunk(file_hash, chunk_index, chunk_data)
                             
-                            # Update reputation for good download + integrity
                             self.reputation.update_reputation(peer_id_for_rep, "SUCCESSFUL_DOWNLOAD")
                             self.reputation.update_reputation(peer_id_for_rep, "VERIFIED_INTEGRITY")
                             
-                            break # Move to the next chunk
+                            break
                         else:
-                            # Chunk is corrupt!
                             logger.warning(f"Chunk {chunk_index} from {peer_addr} is CORRUPT. Discarding.")
                             self.reputation.update_reputation(peer_id_for_rep, "CORRUPTED_DATA")
                             chunk_data = None 
-                            continue # Try this chunk again with the next peer
+                            continue 
                     else:
-                        # Peer refused or had error
                         self.reputation.update_reputation(peer_id_for_rep, "REFUSED_UPLOAD")
                         logger.warning(f"Failed to get chunk {chunk_index} from {peer_addr}. Trying next peer.")
                 
                 except Exception as e:
-                    # Peer timed out
                     self.reputation.update_reputation(peer_id_for_rep, "CONNECTION_TIMEOUT")
                     logger.warning(f"Error connecting to {peer_addr}: {e}. Trying next peer.")
 
             if not chunk_data:
                 logger.error(f"Failed to download chunk {chunk_index} from any peer. Aborting download.")
-                return # Abort download
+                return 
         
-        # 5. Finalize Download
         if self.storage.is_download_complete(file_hash):
             logger.info(f"Download complete for {file_hash[:10]}. Reassembling file...")
             
@@ -274,10 +255,8 @@ class Peer:
             
             if success:
                 logger.info(f"File reassembled at {output_path}")
-                # 6. Final Verification
                 if file_utils.verify_file_integrity(output_path, file_hash):
                     logger.info("File integrity VERIFIED. Download successful!")
-                    # Now that we have the file, re-register to become a seeder
                     self.register_with_tracker()
                 else:
                     logger.error("File integrity check FAILED. Deleting corrupt file.")

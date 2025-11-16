@@ -4,8 +4,7 @@ import logging
 from typing import List, Dict, Optional
 from tqdm import tqdm
 
-# --- Configuration ---
-# Get a logger for this specific module
+
 logger = logging.getLogger(__name__)
 
 def get_file_hash(file_path: str) -> Optional[str]:
@@ -17,7 +16,6 @@ def get_file_hash(file_path: str) -> Optional[str]:
     sha256_hash = hashlib.sha256()
     try:
         with open(file_path, "rb") as f:
-            # Read and update hash in chunks
             for byte_block in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(byte_block)
         return sha256_hash.hexdigest()
@@ -37,15 +35,14 @@ def get_file_metadata(file_path: str, chunk_size: int) -> Optional[Dict[str, any
     try:
         file_size = os.path.getsize(file_path)
         file_name = os.path.basename(file_path)
-        file_hash = get_file_hash(file_path) # Main file hash
+        file_hash = get_file_hash(file_path) 
         
         if file_hash is None:
-            return None # Hashing failed
+            return None 
 
         chunk_hashes = []
         chunk_count = 0
         
-        # Read the file again, this time for chunk hashes
         with open(file_path, 'rb') as f:
             with tqdm(
                 total=file_size, 
@@ -99,7 +96,6 @@ def reassemble_file(file_hash: str, chunk_count: int, chunks_dir: str, output_pa
     """
     try:
         with open(output_path, 'wb') as output_file:
-            # Use tqdm for reassembly progress
             for i in tqdm(range(chunk_count), desc=f"Reassembling {os.path.basename(output_path)}", unit="chunk"):
                 chunk_filename = f"{file_hash}.{i}"
                 chunk_path = os.path.join(chunks_dir, chunk_filename)
@@ -136,7 +132,7 @@ def verify_file_integrity(file_path: str, expected_hash: str) -> bool:
     """Verifies the integrity of a fully reassembled file."""
     actual_hash = get_file_hash(file_path)
     if actual_hash is None:
-        return False # File doesn't exist or read error
+        return False 
         
     is_valid = actual_hash == expected_hash
     if not is_valid:
@@ -145,7 +141,6 @@ def verify_file_integrity(file_path: str, expected_hash: str) -> bool:
         logger.info(f"File integrity check SUCCESS for {file_path}")
     return is_valid
 
-# --- This function is deprecated but kept for completeness ---
 def split_file(file_path: str, chunk_size: int, output_dir: str) -> Optional[Dict[str, any]]:
     """
     Splits a file into chunks and saves them to a directory.
@@ -162,7 +157,7 @@ def split_file(file_path: str, chunk_size: int, output_dir: str) -> Optional[Dic
         file_hash = get_file_hash(file_path)
         
         if file_hash is None:
-            return None # Hashing failed
+            return None 
 
         os.makedirs(output_dir, exist_ok=True)
         

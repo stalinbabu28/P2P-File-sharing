@@ -1,9 +1,7 @@
-# Configuration for the P2P File Sharing Network
-
 tracker:
-  host: "127.0.0.1" # Use 0.0.0.0 to listen on all network interfaces
+  host: "127.0.0.1" 
   port: 9090
-  buffer_size: 4096 # 4KB buffer for socket communication
+  buffer_size: 4096
 
 peer:
-  chunk_size: 1048576 # 1 MB (1024 * 1024)
+  chunk_size: 1048576

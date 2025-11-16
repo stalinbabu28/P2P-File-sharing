@@ -2,10 +2,8 @@ import os
 import json
 import logging
 from typing import Dict, Any, Set, Optional, List
-from peer import file_utils # Import the whole module
+from peer import file_utils
 
-# --- Configuration ---
-# Get a logger for this specific module
 logger = logging.getLogger(__name__)
 
 class StorageManager:
@@ -15,20 +13,17 @@ class StorageManager:
     def __init__(self, peer_id: str):
         self.peer_id = peer_id
         
-        # Define base storage paths
         self.base_dir = f"peer_storage_{self.peer_id}"
-        self.downloads_dir = os.path.join(self.base_dir, "downloads") # For chunks
+        self.downloads_dir = os.path.join(self.base_dir, "downloads")
         self.completed_dir = os.path.join(self.base_dir, "completed")
         self.metadata_file = os.path.join(self.base_dir, "storage_meta.json")
         
-        # Create directories
         os.makedirs(self.downloads_dir, exist_ok=True)
         os.makedirs(self.completed_dir, exist_ok=True)
         
-        # Load or initialize metadata
         self.file_metadata: Dict[str, Dict[str, Any]] = {}
         self.chunk_tracker: Dict[str, Set[int]] = {}
-        self.file_locations: Dict[str, str] = {} # <-- NEW
+        self.file_locations: Dict[str, str] = {}
         self._load_metadata()
 
     def _load_metadata(self):
@@ -38,14 +33,13 @@ class StorageManager:
                 with open(self.metadata_file, 'r') as f:
                     data = json.load(f)
                     self.file_metadata = data.get('file_metadata', {})
-                    self.file_locations = data.get('file_locations', {}) # <-- NEW
-                    # Convert lists back to sets
+                    self.file_locations = data.get('file_locations', {})
                     chunk_data = data.get('chunk_tracker', {})
                     self.chunk_tracker = {h: set(c) for h, c in chunk_data.items()}
                 logger.info(f"Loaded storage metadata from {self.metadata_file}")
             else:
                 logger.info("No existing metadata file found. Starting fresh and creating one.")
-                self._save_metadata() # Create empty file
+                self._save_metadata()
         except json.JSONDecodeError:
             logger.error(f"Error decoding metadata file. Starting fresh.")
             self._reset_metadata()
@@ -63,12 +57,11 @@ class StorageManager:
         """Saves the current file metadata and chunk tracker to disk."""
         try:
             with open(self.metadata_file, 'w') as f:
-                # Convert sets to lists for JSON serialization
                 chunk_data = {h: list(c) for h, c in self.chunk_tracker.items()}
                 data = {
                     'file_metadata': self.file_metadata,
                     'chunk_tracker': chunk_data,
-                    'file_locations': self.file_locations # <-- NEW
+                    'file_locations': self.file_locations
                 }
                 json.dump(data, f, indent=4)
         except IOError as e:
@@ -79,23 +72,19 @@ class StorageManager:
         Analyzes a file for sharing (On-Demand).
         Does NOT copy or split the file, just calculates metadata.
         """
-        # 1. Get absolute path to store as a pointer
         abs_file_path = os.path.abspath(file_path)
         if not os.path.exists(abs_file_path):
             logger.error(f"File not found: {file_path}")
             return None
             
-        # 2. Get all metadata (hashes) from the file
         file_meta = file_utils.get_file_metadata(abs_file_path, chunk_size)
         
         if file_meta:
             file_hash = file_meta['hash']
             self.file_metadata[file_hash] = file_meta
             
-            # 3. Store the *location* of the original file
             self.file_locations[file_hash] = abs_file_path
             
-            # 4. We "own" all chunks of this file
             self.chunk_tracker[file_hash] = set(range(file_meta['chunk_count']))
             
             self._save_metadata()
@@ -116,8 +105,7 @@ class StorageManager:
         file_hash = file_meta['hash']
         if file_hash not in self.file_metadata:
             self.file_metadata[file_hash] = file_meta
-            self.chunk_tracker[file_hash] = set() # We have no chunks yet
-            # Note: We do NOT add this to self.file_locations
+            self.chunk_tracker[file_hash] = set() 
             self._save_metadata()
             logger.info(f"Added new download target: {file_meta['name']} (hash: {file_hash[:10]}...)")
         else:
@@ -136,7 +124,6 @@ class StorageManager:
             with open(chunk_path, 'wb') as f:
                 f.write(chunk_data)
             
-            # Update tracker
             self.chunk_tracker[file_hash].add(chunk_index)
             self._save_metadata()
             logger.debug(f"Stored chunk {chunk_index} for file {file_hash[:10]}...")
@@ -154,12 +141,10 @@ class StorageManager:
             logger.warning(f"Upload requested for chunk {chunk_index} of {file_hash[:10]}, but we don't have it.")
             return None
 
-        # Case 1: We are the original seeder. Read from original file path.
         if file_hash in self.file_locations:
             original_path = self.file_locations[file_hash]
             return file_utils.read_chunk_from_file(original_path, chunk_index, chunk_size)
         
-        # Case 2: We are a leecher-turned-seeder. Read from /downloads.
         chunk_filename = f"{file_hash}.{chunk_index}"
         chunk_path = os.path.join(self.downloads_dir, chunk_filename)
         

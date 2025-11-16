@@ -5,7 +5,6 @@ import yaml
 import logging
 from typing import Dict, Any, Tuple , Optional
 
-# --- Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [Tracker] - %(levelname)s - %(message)s')
 
 CONFIG_FILE = 'config.yaml'
@@ -22,19 +21,14 @@ def load_config():
         logging.error(f"Error loading config: {e}. Exiting.")
         exit(1)
 
-# --- Global State (Thread-Safe) ---
-# file_index -> {"file_hash": {"name": "...", "size": ..., "chunk_count": ..., "chunk_hashes": [...], "peers": set()}}
 file_index: Dict[str, Dict[str, Any]] = {}
 
-# peer_registry -> {"peer_id": ("ip", port)}
 peer_registry: Dict[str, Tuple[str, int]] = {}
 
-# Locks to ensure thread-safety when modifying global state
 index_lock = threading.Lock()
 peer_lock = threading.Lock()
 
 
-# --- NEW ROBUST RECEIVE FUNCTION ---
 def receive_json_message(conn: socket.socket, buffer_size: int) -> Optional[Dict[str, Any]]:
     """
     Robsutly receives a complete JSON message, handling large messages
@@ -45,20 +39,16 @@ def receive_json_message(conn: socket.socket, buffer_size: int) -> Optional[Dict
     
     while True:
         try:
-            # Try to decode the buffer
             message, index = json_decoder.raw_decode(buffer.decode('utf-8'))
-            # If successful, return the message and clear the buffer
-            # (or handle multiple messages if we wanted)
+
             return message
         except json.JSONDecodeError:
-            # Not enough data yet, read more
             data = conn.recv(buffer_size)
             if not data:
                 logging.warning("Connection closed while receiving message.")
                 return None
             buffer += data
         except UnicodeDecodeError:
-            # This can happen if buffer is mid-character
             data = conn.recv(1)
             if not data:
                 return None
@@ -68,7 +58,6 @@ def receive_json_message(conn: socket.socket, buffer_size: int) -> Optional[Dict
             return None
 
 
-# --- Tracker Logic ---
 
 def handle_register(payload: Dict[str, Any], client_ip: str) -> Dict[str, Any]:
     """
@@ -78,7 +67,7 @@ def handle_register(payload: Dict[str, Any], client_ip: str) -> Dict[str, Any]:
     try:
         peer_id = payload['peer_id']
         peer_port = payload['port']
-        files = payload['files'] # List of {"hash": "...", "name": "...", "size": ..., "chunk_count": ..., "chunk_hashes": [...]}
+        files = payload['files'] 
         
         peer_addr = (client_ip, peer_port)
 
@@ -90,15 +79,13 @@ def handle_register(payload: Dict[str, Any], client_ip: str) -> Dict[str, Any]:
             for file_info in files:
                 file_hash = file_info['hash']
                 if file_hash not in file_index:
-                    # First time we see this file
                     file_index[file_hash] = {
                         "name": file_info['name'],
                         "size": file_info['size'],
                         "chunk_count": file_info['chunk_count'],
-                        "chunk_hashes": file_info['chunk_hashes'], # <-- STORE CHUNK HASHES
+                        "chunk_hashes": file_info['chunk_hashes'],
                         "peers": set()
                     }
-                # Add this peer to the set of peers for this file
                 file_index[file_hash]["peers"].add(peer_id)
                 logging.info(f"Indexed file {file_info['name']} (hash: {file_hash[:10]}...) for peer {peer_id}")
         
@@ -144,7 +131,7 @@ def handle_query_file(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "file_name": file_info["name"],
                 "file_size": file_info["size"],
                 "chunk_count": file_info["chunk_count"],
-                "chunk_hashes": file_info["chunk_hashes"], # <-- SEND CHUNK HASHES
+                "chunk_hashes": file_info["chunk_hashes"],
                 "peers": found_peers
             }
             return response
@@ -193,16 +180,13 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]):
     config = load_config()
     buffer_size = config['tracker']['buffer_size']
     
-    peer_id = None # Track which peer this connection belongs to
+    peer_id = None 
     
     try:
-        # --- MODIFIED RECEIVE LOOP ---
         while True:
-            # Use the new robust receive function
             message = receive_json_message(conn, buffer_size)
             
             if not message:
-                # Client disconnected or sent invalid data
                 logging.info(f"Connection from {client_ip}:{client_port} closed or invalid data.")
                 break
             
@@ -222,7 +206,6 @@ def handle_client(conn: socket.socket, addr: Tuple[str, int]):
             else:
                 response = {"status": "error", "message": "Unknown command"}
             
-            # Send response back to peer
             conn.sendall(json.dumps(response).encode('utf-8'))
 
     except socket.error as e:
