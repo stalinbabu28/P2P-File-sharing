@@ -1,3 +1,5 @@
 /venv
 */__pycache__/
 peer_storage_peer_*/
+identity.json
+peer_data_peer*/

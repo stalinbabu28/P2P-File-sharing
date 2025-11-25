@@ -1,3 +1,5 @@
 PyYAML
 argparse
 tqdm
+Flask
+flask-socketio

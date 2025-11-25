@@ -5,45 +5,68 @@ import logging
 import time
 import os
 import yaml
-import queue  # <-- Required for parallel logic
+import queue
+import json
+import shutil
 from typing import Dict, Any, Optional, List, Tuple
-from tqdm import tqdm
 
 from peer.storage import StorageManager
 from peer.reputation import ReputationManager
 from peer import file_utils
 from peer import network_utils
 
-# --- Configuration ---
 logger = logging.getLogger(__name__)
 CONFIG_FILE = 'config.yaml'
 
 class Peer:
-    def __init__(self):
-        self.peer_id: str = f"peer_{uuid.uuid4().hex[:8]}"
+    def __init__(self, instance_name: str = None):
+        # Support separate instances for testing on one PC
+        self.instance_dir = f"peer_data_{instance_name}" if instance_name else None
+        if self.instance_dir:
+            os.makedirs(self.instance_dir, exist_ok=True)
+            self.identity_file = os.path.join(self.instance_dir, "identity.json")
+        else:
+            self.identity_file = "identity.json"
+
+        self.peer_id = self._load_or_create_identity()
+        
         self.config = self._load_config()
+        # Pass the instance_dir to storage manager so each peer has its own folder
+        self.storage = StorageManager(self.peer_id, instance_dir=self.instance_dir)
         
-        self.storage: StorageManager = StorageManager(self.peer_id)
-        self.reputation: ReputationManager = ReputationManager(self.peer_id)
+        # Initialize Reputation Manager
+        self.reputation = ReputationManager(self.peer_id)
         
-        self.server_port: int = self._get_free_port()
-        self.server_host: str = "127.0.0.1"
-        self.server_thread: Optional[threading.Thread] = None
-        self.is_running: bool = True
+        self.server_port = self._get_free_port()
+        self.server_host = "127.0.0.1"
+        self.server_thread = None
+        self.is_running = True
+        self.tracker_sock = None
         
-        self.tracker_sock: Optional[socket.socket] = None
+        # WEB UI STATE
+        self.active_downloads: Dict[str, Dict[str, Any]] = {} 
+        self.download_history: List[Dict[str, Any]] = []
+
+    def _load_or_create_identity(self) -> str:
+        if os.path.exists(self.identity_file):
+            try:
+                with open(self.identity_file, 'r') as f:
+                    data = json.load(f)
+                    if 'peer_id' in data:
+                        return data['peer_id']
+            except: pass
         
-        logger.info(f"Peer {self.peer_id} initializing...")
-        logger.info(f"Storage location: {self.storage.base_dir}")
-        logger.info(f"Reputation DB: {self.reputation.db_path}")
+        new_id = f"peer_{uuid.uuid4().hex[:8]}"
+        with open(self.identity_file, 'w') as f:
+            json.dump({'peer_id': new_id}, f)
+        return new_id
 
     def _load_config(self) -> Dict[str, Any]:
         try:
-            with open(CONFIG_FILE, 'r') as f:
-                return yaml.safe_load(f)
-        except Exception as e:
-            logger.error(f"Failed to load config: {e}. Exiting.")
-            exit(1)
+            with open(CONFIG_FILE, 'r') as f: return yaml.safe_load(f)
+        except:
+            # Fallback config if file fails
+            return {'peer': {'chunk_size': 1048576}, 'tracker': {'host': '127.0.0.1', 'port': 9090, 'buffer_size': 4096}}
 
     def _get_free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -53,244 +76,232 @@ class Peer:
     def start_server(self):
         self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
-        logger.info(f"Peer server starting on {self.server_host}:{self.server_port}...")
+        logger.info(f"Peer server on port {self.server_port}")
 
     def _run_server(self):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
-                server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server_socket.bind((self.server_host, self.server_port))
-                server_socket.listen(5)
-                
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((self.server_host, self.server_port))
+                s.listen(5)
                 while self.is_running:
                     try:
-                        server_socket.settimeout(1.0)
-                        conn, addr = server_socket.accept()
-                        handler_thread = threading.Thread(
-                            target=network_utils.handle_peer_request,
-                            args=(conn, addr, self.storage),
-                            daemon=True
-                        )
-                        handler_thread.start()
-                    except socket.timeout:
-                        continue
-                    except Exception as e:
-                        logger.error(f"Server error accepting connection: {e}")
-                        
-        except OSError as e:
-            if self.is_running:
-                logger.error(f"Peer server socket error: {e}")
-        finally:
-            logger.info("Peer server shutting down.")
+                        s.settimeout(1.0)
+                        conn, addr = s.accept()
+                        threading.Thread(target=network_utils.handle_peer_request, 
+                                       args=(conn, addr, self.storage), daemon=True).start()
+                    except socket.timeout: continue
+        except Exception as e: logger.error(f"Server error: {e}")
 
     def start_tracker_connection(self):
         if self.tracker_sock: return
-        logger.info("Connecting to tracker...")
         self.tracker_sock = network_utils.connect_to_tracker()
-        if not self.tracker_sock:
-            logger.error("Failed to connect to tracker.")
 
     def register_with_tracker(self):
-        if not self.tracker_sock:
-            self.start_tracker_connection()
-            if not self.tracker_sock: return
-
-        logger.info("Registering with tracker...")
-        try:
-            files_info = self.storage.get_shared_files_info()
-            response = network_utils.register_with_tracker(
-                self.tracker_sock, self.peer_id, self.server_port, files_info
-            )
-            if response.get('status') == 'success':
-                logger.info("Successfully registered with tracker.")
-            else:
-                logger.warning(f"Tracker registration failed: {response.get('message')}")
-        except Exception as e:
-            logger.error(f"Error communicating with tracker: {e}")
-            if self.tracker_sock: self.tracker_sock.close()
-            self.tracker_sock = None
+        if not self.tracker_sock: self.start_tracker_connection()
+        if self.tracker_sock:
+            try:
+                files = self.storage.get_shared_files_info()
+                network_utils.register_with_tracker(self.tracker_sock, self.peer_id, self.server_port, files)
+            except:
+                if self.tracker_sock: self.tracker_sock.close()
+                self.tracker_sock = None
 
     def share_file(self, file_path: str):
-        logger.info(f"Sharing new file: {file_path}")
-        chunk_size = self.config['peer']['chunk_size']
-        file_meta = self.storage.add_file_to_share(file_path, chunk_size)
-        
-        if file_meta:
-            logger.info(f"File '{file_meta['name']}' processed. Hash: {file_meta['hash']}")
-            self.register_with_tracker()
-        else:
-            logger.error(f"Failed to process and share file: {file_path}")
+        meta = self.storage.add_file_to_share(file_path, self.config['peer']['chunk_size'])
+        if meta: self.register_with_tracker()
+        return meta
 
-    # --- PARALLEL DOWNLOAD LOGIC ---
-    def _download_worker(self, 
-                         worker_id: int,
-                         chunk_queue: queue.Queue, 
-                         file_hash: str, 
-                         file_meta: Dict[str, Any], 
-                         sorted_peers: List[Tuple[str, Tuple[str, int]]],
-                         progress_bar: tqdm):
-        """
-        Worker thread function to process download chunks from the queue.
-        """
+    def search_files(self, query: str) -> List[Dict[str, Any]]:
+        if not self.tracker_sock: self.start_tracker_connection()
+        if not self.tracker_sock: return []
+        try:
+            resp = network_utils.search_tracker(self.tracker_sock, query)
+            return resp.get('results', [])
+        except: return []
+
+    # --- DOWNLOAD LOGIC ---
+
+    def start_download_thread(self, file_hash: str, destination_path: str = None):
+        if file_hash in self.active_downloads and self.active_downloads[file_hash]['status'] == 'Downloading':
+            return
+        t = threading.Thread(target=self.download_file, args=(file_hash, destination_path), daemon=True)
+        t.start()
+
+    def _download_worker(self, q: queue.Queue, f_hash: str, f_meta: dict, peers: list):
         while True:
-            try:
-                # Get a chunk index from the queue. Block for 1s to check stopping conditions.
-                chunk_index = chunk_queue.get(timeout=1)
-            except queue.Empty:
-                # If queue is empty, this worker is done
-                return
+            try: 
+                idx = q.get(timeout=1)
+            except queue.Empty: return
 
             success = False
-            
-            # --- LOAD BALANCING FIX: Round-Robin ---
-            # Instead of always starting with the first peer (highest reputation),
-            # we rotate the list based on the chunk index. This distributes
-            # requests across all available peers evenly.
-            num_peers = len(sorted_peers)
-            if num_peers > 0:
-                # E.g., Chunk 0 starts at peer 0, Chunk 1 starts at peer 1
-                start_idx = chunk_index % num_peers
-                # Create a rotated view of the peers list for this chunk
-                # Peers are still tried in reputation order relative to the start index
-                peers_to_try = sorted_peers[start_idx:] + sorted_peers[:start_idx]
-            else:
-                peers_to_try = sorted_peers
-
-            for peer_id, peer_addr in peers_to_try:
-                if peer_id == self.peer_id: continue
-
-                try:
-                    chunk_data = network_utils.request_chunk_from_peer(peer_addr, file_hash, chunk_index)
-                    
-                    if chunk_data:
-                        expected_hash = file_meta['chunk_hashes'][chunk_index]
-                        if file_utils.verify_chunk_data(chunk_data, expected_hash):
-                            # Success!
-                            logger.debug(f"[Worker-{worker_id}] Chunk {chunk_index} verified.")
-                            self.storage.store_chunk(file_hash, chunk_index, chunk_data)
-                            
-                            self.reputation.update_reputation(peer_id, "SUCCESSFUL_DOWNLOAD")
-                            self.reputation.update_reputation(peer_id, "VERIFIED_INTEGRITY")
-                            
-                            success = True
-                            break # Stop trying peers for this chunk
-                        else:
-                            logger.warning(f"[Worker-{worker_id}] Chunk {chunk_index} from {peer_addr} CORRUPT.")
-                            self.reputation.update_reputation(peer_id, "CORRUPTED_DATA")
-                    else:
-                        # Network failure or refusal
-                        pass 
+            if not peers: 
+                q.task_done()
+                continue
                 
-                except Exception as e:
-                    logger.warning(f"[Worker-{worker_id}] Error downloading chunk {chunk_index}: {e}")
+            start = idx % len(peers)
+            rotated_peers = peers[start:] + peers[:start]
 
+            for pid, addr in rotated_peers:
+                if pid == self.peer_id: continue
+                try:
+                    data = network_utils.request_chunk_from_peer(addr, f_hash, idx)
+                    if data and file_utils.verify_chunk_data(data, f_meta['chunk_hashes'][idx]):
+                        self.storage.store_chunk(f_hash, idx, data)
+                        self.reputation.update_reputation(pid, "SUCCESSFUL_DOWNLOAD")
+                        self.reputation.update_reputation(pid, "VERIFIED_INTEGRITY")
+                        success = True
+                        break
+                    elif data:
+                        self.reputation.update_reputation(pid, "CORRUPTED_DATA")
+                except: pass
+            
             if success:
-                # Update the progress bar safely
-                progress_bar.update(1)
-                chunk_queue.task_done()
+                if f_hash in self.active_downloads:
+                    self.active_downloads[f_hash]['completed_chunks'] += 1
+                    total = self.active_downloads[f_hash]['total_chunks']
+                    if total > 0:
+                        self.active_downloads[f_hash]['progress'] = (self.active_downloads[f_hash]['completed_chunks'] / total) * 100
+                q.task_done()
             else:
-                logger.error(f"[Worker-{worker_id}] Failed to download chunk {chunk_index} from any peer.")
-                chunk_queue.task_done()
+                q.task_done()
 
-    def download_file(self, file_hash: str):
-        """
-        Main download entry point. Sets up the queue and workers.
-        """
-        logger.info(f"Attempting to download file: {file_hash[:10]}...")
-        
-        # 1. Query Tracker
-        if not self.tracker_sock:
-            self.start_tracker_connection()
-            if not self.tracker_sock: return
-
+    def download_file(self, file_hash: str, destination_path: str = None):
+        if not self.tracker_sock: self.start_tracker_connection()
         try:
-            response = network_utils.query_tracker_for_file(self.tracker_sock, file_hash)
-        except Exception as e:
-            logger.error(f"Error querying tracker: {e}")
-            return
+            resp = network_utils.query_tracker_for_file(self.tracker_sock, file_hash)
+            if resp.get('status') != 'success': return
+
+            f_meta = {
+                'name': resp['file_name'], 'size': resp['file_size'],
+                'chunk_hashes': resp['chunk_hashes'], 'chunk_count': resp['chunk_count']
+            }
+            self.storage.add_downloading_file({'hash': file_hash, **f_meta})
             
-        if response.get('status') != 'success':
-            logger.error(f"Tracker query failed: {response.get('message')}")
-            return
+            missing = list(self.storage.get_missing_chunks(file_hash))
             
-        # 2. Prepare Metadata
-        file_meta = {
-            "name": response.get('file_name'),
-            "size": response.get('file_size'),
-            "hash": file_hash,
-            "chunk_count": response.get('chunk_count'),
-            "chunk_hashes": response.get('chunk_hashes', [])
-        }
-        self.storage.add_downloading_file(file_meta)
-        
-        # 3. Get Peers
-        peer_list = response.get('peers', [])
-        if not peer_list:
-            logger.warning("No peers found for file.")
-            return
+            self.active_downloads[file_hash] = {
+                'hash': file_hash,
+                'name': f_meta['name'],
+                'size': f_meta['size'],
+                'total_chunks': f_meta['chunk_count'],
+                'completed_chunks': f_meta['chunk_count'] - len(missing),
+                'progress': 0,
+                'status': 'Downloading',
+                'final_path': ''
+            }
 
-        # Sort peers
-        peer_ids = [p['id'] for p in peer_list]
-        sorted_peers_with_score = self.reputation.get_peers_sorted_by_reputation(peer_ids)
-        peer_addr_map = {p['id']: (p['ip'], p['port']) for p in peer_list}
-        
-        # List of (peer_id, addr) tuples
-        sorted_peer_addrs = []
-        for peer_id, score in sorted_peers_with_score:
-            if peer_id in peer_addr_map:
-                sorted_peer_addrs.append((peer_id, peer_addr_map[peer_id]))
-        
-        logger.info(f"Found {len(sorted_peer_addrs)} peers.")
+            if not missing:
+                # --- FIX START: Handle missing chunks/files for "Completed" items ---
+                
+                # 1. Are we the seeder? (Have original file)
+                original_path = self.storage.get_original_file_path(file_hash)
+                if original_path and os.path.exists(original_path):
+                    # We already have the original file, no need to reassemble!
+                    # If user asked for a specific destination, we can COPY it there.
+                    self._finalize_download(file_hash, original_path, destination_path, move=False)
+                    return
 
-        # 4. Queue Setup
-        missing_chunks = list(self.storage.get_missing_chunks(file_hash))
-        if not missing_chunks:
-            logger.info("File already downloaded!")
-            return
+                # 2. Do we have the reassembled file in default completed?
+                out = os.path.join(self.storage.completed_dir, f_meta['name'])
+                if os.path.exists(out):
+                    self._finalize_download(file_hash, out, destination_path)
+                    return
 
-        chunk_queue = queue.Queue()
-        for chunk_idx in missing_chunks:
-            chunk_queue.put(chunk_idx)
+                # 3. Do we actually have the chunks to reassemble?
+                if self.storage.has_physical_chunks(file_hash, f_meta['chunk_count']):
+                    if file_utils.reassemble_file(file_hash, f_meta['chunk_count'], self.storage.downloads_dir, out):
+                        self._finalize_download(file_hash, out, destination_path)
+                        return
+                
+                # 4. If we are here, metadata says "Done" but we have NO data.
+                # We must reset and download again.
+                logger.warning(f"Metadata mismatch for {f_meta['name']}. Chunks missing. Restarting download.")
+                # Force 'missing' to be all chunks
+                missing = list(range(f_meta['chunk_count']))
+                # --- FIX END ---
 
-        # 5. Start Workers
-        NUM_WORKERS = 4
-        threads = []
-        
-        # Create shared progress bar
-        with tqdm(total=len(missing_chunks), desc=f"Downloading {file_meta['name']}", unit="chunk") as pbar:
-            
-            for i in range(NUM_WORKERS):
-                t = threading.Thread(
-                    target=self._download_worker,
-                    args=(i, chunk_queue, file_hash, file_meta, sorted_peer_addrs, pbar),
-                    daemon=True
-                )
+            peer_list = resp.get('peers', [])
+            peer_ids = [p['id'] for p in peer_list]
+            sorted_ids = self.reputation.get_peers_sorted_by_reputation(peer_ids)
+            addr_map = {p['id']: (p['ip'], p['port']) for p in peer_list}
+            sorted_peers = [(pid, addr_map[pid]) for pid, _ in sorted_ids if pid in addr_map]
+
+            q = queue.Queue()
+            for i in missing: q.put(i)
+
+            threads = []
+            for _ in range(4):
+                t = threading.Thread(target=self._download_worker, args=(q, file_hash, f_meta, sorted_peers))
                 t.start()
                 threads.append(t)
             
-            # Wait for queue to be empty
-            chunk_queue.join()
-            
-            # Wait for threads to finish (they exit when queue is empty)
-            for t in threads:
-                t.join()
+            q.join()
+            for t in threads: t.join()
 
-        # 6. Reassembly
-        if self.storage.is_download_complete(file_hash):
-            logger.info("Download complete. Reassembling...")
-            output_path = os.path.join(self.storage.completed_dir, file_meta['name'])
-            if file_utils.reassemble_file(file_hash, file_meta['chunk_count'], self.storage.downloads_dir, output_path):
-                if file_utils.verify_file_integrity(output_path, file_hash):
-                    logger.info("File verified successfully!")
-                    self.register_with_tracker()
+            if self.storage.is_download_complete(file_hash):
+                default_out = os.path.join(self.storage.completed_dir, f_meta['name'])
+                
+                # Guard against reassembly crash
+                if self.storage.has_physical_chunks(file_hash, f_meta['chunk_count']):
+                    success = file_utils.reassemble_file(file_hash, f_meta['chunk_count'], self.storage.downloads_dir, default_out)
+                    if success:
+                        self._finalize_download(file_hash, default_out, destination_path)
+                    else:
+                        logger.error(f"Reassembly failed for {file_hash}")
+                        self.active_downloads[file_hash]['status'] = 'Reassembly Failed'
                 else:
-                    logger.error("File integrity failed after reassembly.")
-        else:
-            logger.error("Download finished but file is incomplete.")
+                     self.active_downloads[file_hash]['status'] = 'Missing Chunks'
+            else:
+                self.active_downloads[file_hash]['status'] = 'Stalled'
+
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            if file_hash in self.active_downloads:
+                self.active_downloads[file_hash]['status'] = 'Error'
+
+    def _finalize_download(self, file_hash: str, current_path: str, destination_path: str = None, move: bool = True):
+        final_path = os.path.abspath(current_path)
+        
+        if not os.path.exists(current_path):
+            logger.error(f"Finalize failed: Source file missing at {current_path}")
+            if file_hash in self.active_downloads:
+                self.active_downloads[file_hash]['status'] = 'File Missing'
+            return
+
+        if destination_path:
+            if not os.path.exists(destination_path):
+                try: os.makedirs(destination_path, exist_ok=True)
+                except: destination_path = None 
+
+            if destination_path:
+                try:
+                    fname = os.path.basename(current_path)
+                    custom_out = os.path.join(destination_path, fname)
+                    
+                    if os.path.exists(custom_out): os.remove(custom_out)
+                    
+                    if move:
+                        shutil.move(current_path, custom_out)
+                    else:
+                        # If we are the seeder (move=False), we COPY instead of move so we don't lose the original
+                        shutil.copy2(current_path, custom_out)
+                        
+                    final_path = os.path.abspath(custom_out)
+                    logger.info(f"Moved file to: {final_path}")
+                except Exception as e:
+                    logger.error(f"Move failed: {e}")
+
+        self.register_with_tracker()
+
+        if file_hash in self.active_downloads:
+            completed_info = self.active_downloads.pop(file_hash)
+            completed_info['status'] = 'Complete'
+            completed_info['progress'] = 100
+            completed_info['final_path'] = final_path
+            completed_info['timestamp'] = time.time()
+            self.download_history.insert(0, completed_info)
 
     def stop(self):
         self.is_running = False
-        self.reputation.close()
         if self.tracker_sock: self.tracker_sock.close()
-        if self.server_thread: self.server_thread.join()
-        logger.info(f"Peer {self.peer_id} has shut down.")

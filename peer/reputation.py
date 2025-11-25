@@ -1,8 +1,8 @@
 import sqlite3
 import logging
 import os
-import threading # <-- Added
-from typing import List, Tuple, Optional
+import threading
+from typing import List, Tuple, Optional, Dict, Any # <-- Added Any here
 
 # --- Configuration ---
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ DEFAULT_REPUTATION = 10
 class ReputationManager:
     def __init__(self, peer_id: str):
         self.peer_id = peer_id
-        self.lock = threading.Lock() # <-- Mutex for thread safety
+        self.lock = threading.Lock()
         self.db_path = f"peer_storage_{self.peer_id}/reputation.db"
         
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
@@ -34,7 +34,6 @@ class ReputationManager:
     
     def _init_db(self) -> Optional[sqlite3.Connection]:
         try:
-            # check_same_thread=False is required, but we use a Lock anyway for safety
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             cursor = conn.cursor()
             cursor.execute('''
@@ -54,7 +53,7 @@ class ReputationManager:
     def get_reputation(self, peer_id: str) -> float:
         if self.conn is None: return DEFAULT_REPUTATION
         
-        with self.lock: # Protected read
+        with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute("SELECT score FROM reputation WHERE peer_id = ?", (peer_id,))
@@ -66,6 +65,23 @@ class ReputationManager:
                 logger.error(f"Error getting reputation for {peer_id}: {e}")
                 return DEFAULT_REPUTATION
 
+    def get_all_reputations(self) -> List[Dict[str, Any]]:
+        """Returns all peers and their scores for the UI."""
+        if self.conn is None: return []
+        
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("SELECT peer_id, score, interactions FROM reputation ORDER BY score DESC")
+                rows = cursor.fetchall()
+                return [
+                    {"peer_id": r[0], "score": round(r[1], 2), "interactions": r[2]} 
+                    for r in rows
+                ]
+            except sqlite3.Error as e:
+                logger.error(f"Error listing reputations: {e}")
+                return []
+
     def update_reputation(self, peer_id: str, event_type: str):
         if self.conn is None: return
 
@@ -74,7 +90,7 @@ class ReputationManager:
             logger.warning(f"Unknown reputation event type: {event_type}")
             return
 
-        with self.lock: # Protected write transaction
+        with self.lock:
             try:
                 cursor = self.conn.cursor()
                 
@@ -113,7 +129,6 @@ class ReputationManager:
             try:
                 peer_scores = []
                 for peer_id in peer_ids:
-                    # Internal logic replicated to stay within one lock transaction
                     cursor = self.conn.cursor()
                     cursor.execute("SELECT score FROM reputation WHERE peer_id = ?", (peer_id,))
                     result = cursor.fetchone()
