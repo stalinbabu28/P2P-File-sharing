@@ -12,6 +12,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from peer.storage import StorageManager
 from peer.reputation import ReputationManager
+from peer.metrics import MetricsLogger
 from peer import file_utils
 from peer import network_utils
 
@@ -19,8 +20,9 @@ logger = logging.getLogger(__name__)
 CONFIG_FILE = 'config.yaml'
 
 class Peer:
-    def __init__(self, instance_name: str = None):
-        # Support separate instances for testing on one PC
+    def __init__(self, instance_name: str = None, behavior: str = 'good'):
+        self.behavior = behavior  # 'good', 'freeloader', 'malicious'
+        
         self.instance_dir = f"peer_data_{instance_name}" if instance_name else None
         if self.instance_dir:
             os.makedirs(self.instance_dir, exist_ok=True)
@@ -29,12 +31,11 @@ class Peer:
             self.identity_file = "identity.json"
 
         self.peer_id = self._load_or_create_identity()
-        
+        self.metrics = MetricsLogger(self.peer_id)
+        self.metrics.log("startup", {"behavior": self.behavior, "instance": instance_name})
+
         self.config = self._load_config()
-        # Pass the instance_dir to storage manager so each peer has its own folder
         self.storage = StorageManager(self.peer_id, instance_dir=self.instance_dir)
-        
-        # Initialize Reputation Manager
         self.reputation = ReputationManager(self.peer_id)
         
         self.server_port = self._get_free_port()
@@ -43,7 +44,6 @@ class Peer:
         self.is_running = True
         self.tracker_sock = None
         
-        # WEB UI STATE
         self.active_downloads: Dict[str, Dict[str, Any]] = {} 
         self.download_history: List[Dict[str, Any]] = []
 
@@ -52,20 +52,16 @@ class Peer:
             try:
                 with open(self.identity_file, 'r') as f:
                     data = json.load(f)
-                    if 'peer_id' in data:
-                        return data['peer_id']
+                    if 'peer_id' in data: return data['peer_id']
             except: pass
-        
         new_id = f"peer_{uuid.uuid4().hex[:8]}"
-        with open(self.identity_file, 'w') as f:
-            json.dump({'peer_id': new_id}, f)
+        with open(self.identity_file, 'w') as f: json.dump({'peer_id': new_id}, f)
         return new_id
 
     def _load_config(self) -> Dict[str, Any]:
         try:
             with open(CONFIG_FILE, 'r') as f: return yaml.safe_load(f)
         except:
-            # Fallback config if file fails
             return {'peer': {'chunk_size': 1048576}, 'tracker': {'host': '127.0.0.1', 'port': 9090, 'buffer_size': 4096}}
 
     def _get_free_port(self) -> int:
@@ -76,7 +72,7 @@ class Peer:
     def start_server(self):
         self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
-        logger.info(f"Peer server on port {self.server_port}")
+        logger.info(f"Peer server on port {self.server_port} [{self.behavior}]")
 
     def _run_server(self):
         try:
@@ -88,8 +84,9 @@ class Peer:
                     try:
                         s.settimeout(1.0)
                         conn, addr = s.accept()
+                        # Pass behavior to the handler
                         threading.Thread(target=network_utils.handle_peer_request, 
-                                       args=(conn, addr, self.storage), daemon=True).start()
+                                       args=(conn, addr, self.storage, self.behavior), daemon=True).start()
                     except socket.timeout: continue
         except Exception as e: logger.error(f"Server error: {e}")
 
@@ -123,38 +120,56 @@ class Peer:
     # --- DOWNLOAD LOGIC ---
 
     def start_download_thread(self, file_hash: str, destination_path: str = None):
-        if file_hash in self.active_downloads and self.active_downloads[file_hash]['status'] == 'Downloading':
-            return
+        if file_hash in self.active_downloads and self.active_downloads[file_hash]['status'] == 'Downloading': return
         t = threading.Thread(target=self.download_file, args=(file_hash, destination_path), daemon=True)
         t.start()
 
+    def _update_rep_and_log(self, peer_id, event):
+        old, new = self.reputation.update_reputation(peer_id, event)
+        self.metrics.log_reputation(peer_id, event, old, new)
+
     def _download_worker(self, q: queue.Queue, f_hash: str, f_meta: dict, peers: list):
         while True:
-            try: 
-                idx = q.get(timeout=1)
+            try: idx = q.get(timeout=1)
             except queue.Empty: return
 
             success = False
             if not peers: 
                 q.task_done()
                 continue
-                
+            
             start = idx % len(peers)
             rotated_peers = peers[start:] + peers[:start]
 
             for pid, addr in rotated_peers:
                 if pid == self.peer_id: continue
+                
+                start_time = time.time()
                 try:
                     data = network_utils.request_chunk_from_peer(addr, f_hash, idx)
-                    if data and file_utils.verify_chunk_data(data, f_meta['chunk_hashes'][idx]):
-                        self.storage.store_chunk(f_hash, idx, data)
-                        self.reputation.update_reputation(pid, "SUCCESSFUL_DOWNLOAD")
-                        self.reputation.update_reputation(pid, "VERIFIED_INTEGRITY")
-                        success = True
-                        break
-                    elif data:
-                        self.reputation.update_reputation(pid, "CORRUPTED_DATA")
-                except: pass
+                    duration = time.time() - start_time
+                    
+                    if data:
+                        size = len(data)
+                        speed = (size * 8) / (duration * 1000000) if duration > 0 else 0 # Mbps
+                        
+                        if file_utils.verify_chunk_data(data, f_meta['chunk_hashes'][idx]):
+                            self.storage.store_chunk(f_hash, idx, data)
+                            
+                            self._update_rep_and_log(pid, "SUCCESSFUL_DOWNLOAD")
+                            self._update_rep_and_log(pid, "VERIFIED_INTEGRITY")
+                            self.metrics.log_download(f_hash, idx, duration, size, pid, "success", speed)
+                            success = True
+                            break
+                        else:
+                            self._update_rep_and_log(pid, "CORRUPTED_DATA")
+                            self.metrics.log_download(f_hash, idx, duration, size, pid, "corrupt", speed)
+                    else:
+                        # Failed/Refused
+                        self._update_rep_and_log(pid, "REFUSED_UPLOAD")
+                        self.metrics.log_download(f_hash, idx, duration, 0, pid, "failed", 0)
+                except Exception: 
+                    pass
             
             if success:
                 if f_hash in self.active_downloads:
@@ -177,49 +192,31 @@ class Peer:
                 'chunk_hashes': resp['chunk_hashes'], 'chunk_count': resp['chunk_count']
             }
             self.storage.add_downloading_file({'hash': file_hash, **f_meta})
+            self.metrics.log("download_start", {"file": f_meta['name'], "size": f_meta['size']})
             
             missing = list(self.storage.get_missing_chunks(file_hash))
             
             self.active_downloads[file_hash] = {
-                'hash': file_hash,
-                'name': f_meta['name'],
-                'size': f_meta['size'],
+                'hash': file_hash, 'name': f_meta['name'], 'size': f_meta['size'],
                 'total_chunks': f_meta['chunk_count'],
                 'completed_chunks': f_meta['chunk_count'] - len(missing),
-                'progress': 0,
-                'status': 'Downloading',
-                'final_path': ''
+                'progress': 0, 'status': 'Downloading', 'final_path': ''
             }
 
             if not missing:
-                # --- FIX START: Handle missing chunks/files for "Completed" items ---
-                
-                # 1. Are we the seeder? (Have original file)
                 original_path = self.storage.get_original_file_path(file_hash)
                 if original_path and os.path.exists(original_path):
-                    # We already have the original file, no need to reassemble!
-                    # If user asked for a specific destination, we can COPY it there.
                     self._finalize_download(file_hash, original_path, destination_path, move=False)
                     return
-
-                # 2. Do we have the reassembled file in default completed?
                 out = os.path.join(self.storage.completed_dir, f_meta['name'])
                 if os.path.exists(out):
                     self._finalize_download(file_hash, out, destination_path)
                     return
-
-                # 3. Do we actually have the chunks to reassemble?
                 if self.storage.has_physical_chunks(file_hash, f_meta['chunk_count']):
                     if file_utils.reassemble_file(file_hash, f_meta['chunk_count'], self.storage.downloads_dir, out):
                         self._finalize_download(file_hash, out, destination_path)
                         return
-                
-                # 4. If we are here, metadata says "Done" but we have NO data.
-                # We must reset and download again.
-                logger.warning(f"Metadata mismatch for {f_meta['name']}. Chunks missing. Restarting download.")
-                # Force 'missing' to be all chunks
                 missing = list(range(f_meta['chunk_count']))
-                # --- FIX END ---
 
             peer_list = resp.get('peers', [])
             peer_ids = [p['id'] for p in peer_list]
@@ -241,19 +238,19 @@ class Peer:
 
             if self.storage.is_download_complete(file_hash):
                 default_out = os.path.join(self.storage.completed_dir, f_meta['name'])
-                
-                # Guard against reassembly crash
                 if self.storage.has_physical_chunks(file_hash, f_meta['chunk_count']):
                     success = file_utils.reassemble_file(file_hash, f_meta['chunk_count'], self.storage.downloads_dir, default_out)
                     if success:
                         self._finalize_download(file_hash, default_out, destination_path)
+                        self.metrics.log("download_complete", {"file": f_meta['name'], "status": "success"})
                     else:
-                        logger.error(f"Reassembly failed for {file_hash}")
                         self.active_downloads[file_hash]['status'] = 'Reassembly Failed'
+                        self.metrics.log("download_complete", {"file": f_meta['name'], "status": "reassembly_failed"})
                 else:
                      self.active_downloads[file_hash]['status'] = 'Missing Chunks'
             else:
                 self.active_downloads[file_hash]['status'] = 'Stalled'
+                self.metrics.log("download_complete", {"file": f_meta['name'], "status": "stalled"})
 
         except Exception as e:
             logger.error(f"Download failed: {e}")
@@ -262,38 +259,23 @@ class Peer:
 
     def _finalize_download(self, file_hash: str, current_path: str, destination_path: str = None, move: bool = True):
         final_path = os.path.abspath(current_path)
-        
-        if not os.path.exists(current_path):
-            logger.error(f"Finalize failed: Source file missing at {current_path}")
-            if file_hash in self.active_downloads:
-                self.active_downloads[file_hash]['status'] = 'File Missing'
-            return
+        if not os.path.exists(current_path): return
 
         if destination_path:
             if not os.path.exists(destination_path):
                 try: os.makedirs(destination_path, exist_ok=True)
                 except: destination_path = None 
-
             if destination_path:
                 try:
                     fname = os.path.basename(current_path)
                     custom_out = os.path.join(destination_path, fname)
-                    
                     if os.path.exists(custom_out): os.remove(custom_out)
-                    
-                    if move:
-                        shutil.move(current_path, custom_out)
-                    else:
-                        # If we are the seeder (move=False), we COPY instead of move so we don't lose the original
-                        shutil.copy2(current_path, custom_out)
-                        
+                    if move: shutil.move(current_path, custom_out)
+                    else: shutil.copy2(current_path, custom_out)
                     final_path = os.path.abspath(custom_out)
-                    logger.info(f"Moved file to: {final_path}")
-                except Exception as e:
-                    logger.error(f"Move failed: {e}")
+                except Exception: pass
 
         self.register_with_tracker()
-
         if file_hash in self.active_downloads:
             completed_info = self.active_downloads.pop(file_hash)
             completed_info['status'] = 'Complete'

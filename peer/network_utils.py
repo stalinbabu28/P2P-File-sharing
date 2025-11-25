@@ -3,9 +3,9 @@ import json
 import logging
 import yaml
 import os
+import time
 from typing import Dict, Any, Optional, Tuple
 
-# --- Configuration ---
 logger = logging.getLogger(__name__)
 CONFIG_FILE = 'config.yaml'
 
@@ -17,7 +17,7 @@ def send_message(sock: socket.socket, message: Dict[str, Any]):
     try:
         sock.sendall(json.dumps(message).encode('utf-8'))
     except socket.error as e:
-        logger.error(f"Failed to send: {e}")
+        logger.error(f"Failed to send message: {e}")
         raise
 
 def receive_json_message(sock: socket.socket, buffer_size: int) -> Optional[Dict[str, Any]]:
@@ -44,9 +44,7 @@ def connect_to_tracker() -> Optional[socket.socket]:
         sock.connect((config['tracker']['host'], config['tracker']['port']))
         sock.settimeout(10.0)
         return sock
-    except Exception as e:
-        logger.error(f"Tracker connection failed: {e}")
-        return None
+    except Exception: return None
 
 def register_with_tracker(sock: socket.socket, peer_id: str, peer_port: int, files: list) -> Dict[str, Any]:
     msg = {"command": "register", "payload": {"peer_id": peer_id, "port": peer_port, "files": files}}
@@ -58,7 +56,6 @@ def query_tracker_for_file(sock: socket.socket, file_hash: str) -> Dict[str, Any
     send_message(sock, msg)
     return receive_json_message(sock, load_config()['tracker']['buffer_size']) or {}
 
-# --- NEW SEARCH FUNCTION ---
 def search_tracker(sock: socket.socket, query: str) -> Dict[str, Any]:
     msg = {"command": "search", "payload": {"query": query}}
     send_message(sock, msg)
@@ -67,10 +64,9 @@ def search_tracker(sock: socket.socket, query: str) -> Dict[str, Any]:
 # --- Peer Communication ---
 
 def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_index: int) -> Optional[bytes]:
-    logger.debug(f"Requesting chunk {chunk_index} from {peer_addr}")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(15.0)
+            sock.settimeout(5.0) # Shorter timeout for testing
             sock.connect(peer_addr)
             
             send_message(sock, {
@@ -78,6 +74,7 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
                 "payload": {"file_hash": file_hash, "chunk_index": chunk_index}
             })
             
+            # Receive header
             buffer = b""
             raw_data_buffer = b""
             while True:
@@ -95,6 +92,7 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
             
             if header.get('status') != 'success': return None
             
+            # Receive body
             chunk_data = raw_data_buffer
             received = len(chunk_data)
             total = header.get('chunk_size', 0)
@@ -102,23 +100,47 @@ def request_chunk_from_peer(peer_addr: Tuple[str, int], file_hash: str, chunk_in
             
             while received < total:
                 data = sock.recv(min(cfg_buf, total - received))
-                if not data: return None
+                if not data: break
                 chunk_data += data
                 received += len(data)
             
+            if len(chunk_data) != total:
+                return None
+                
             return chunk_data
     except Exception:
         return None
 
-def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_manager):
-    logger.info(f"Connection from {addr}")
+def handle_peer_request(conn: socket.socket, addr: Tuple[str, int], storage_manager, behavior: str = 'good'):
+    """
+    Handles incoming requests with support for behaviors:
+    - 'good': Normal operation.
+    - 'freeloader': Rejects all upload requests.
+    - 'malicious': Sends corrupt/garbage data.
+    """
+    logger.info(f"Connection from {addr} [Behavior: {behavior}]")
     try:
         config = load_config()
         msg = receive_json_message(conn, config['tracker']['buffer_size'])
         if not msg: return
 
         if msg.get('command') == 'request_chunk':
+            # --- BEHAVIOR CHECK ---
+            if behavior == 'freeloader':
+                send_message(conn, {"status": "error", "message": "Refused: I am a freeloader"})
+                return
+
             p = msg.get('payload', {})
+            
+            if behavior == 'malicious':
+                # Send garbage data
+                garbage_size = config['peer']['chunk_size']
+                send_message(conn, {"status": "success", "chunk_size": garbage_size})
+                conn.sendall(os.urandom(garbage_size))
+                logger.info(f"Sent MALICIOUS chunk {p.get('chunk_index')} to {addr}")
+                return
+
+            # Normal 'good' behavior
             data = storage_manager.get_chunk_data_for_upload(
                 p.get('file_hash'), p.get('chunk_index'), config['peer']['chunk_size']
             )

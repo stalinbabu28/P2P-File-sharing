@@ -2,7 +2,7 @@ import sqlite3
 import logging
 import os
 import threading
-from typing import List, Tuple, Optional, Dict, Any # <-- Added Any here
+from typing import List, Tuple, Optional, Dict, Any
 
 # --- Configuration ---
 logger = logging.getLogger(__name__)
@@ -66,7 +66,6 @@ class ReputationManager:
                 return DEFAULT_REPUTATION
 
     def get_all_reputations(self) -> List[Dict[str, Any]]:
-        """Returns all peers and their scores for the UI."""
         if self.conn is None: return []
         
         with self.lock:
@@ -82,13 +81,16 @@ class ReputationManager:
                 logger.error(f"Error listing reputations: {e}")
                 return []
 
-    def update_reputation(self, peer_id: str, event_type: str):
-        if self.conn is None: return
+    def update_reputation(self, peer_id: str, event_type: str) -> Tuple[float, float]:
+        """
+        Updates reputation and returns (old_score, new_score).
+        """
+        if self.conn is None: return (DEFAULT_REPUTATION, DEFAULT_REPUTATION)
 
         delta_r = REPUTATION_RULES.get(event_type)
         if delta_r is None:
             logger.warning(f"Unknown reputation event type: {event_type}")
-            return
+            return (DEFAULT_REPUTATION, DEFAULT_REPUTATION)
 
         with self.lock:
             try:
@@ -118,8 +120,11 @@ class ReputationManager:
                 self.conn.commit()
                 logger.debug(f"Updated reputation for {peer_id}: {old_score:.2f} -> {new_score:.2f} (Event: {event_type})")
                 
+                return (old_score, new_score)
+                
             except sqlite3.Error as e:
                 logger.error(f"Error updating reputation for {peer_id}: {e}")
+                return (DEFAULT_REPUTATION, DEFAULT_REPUTATION)
 
     def get_peers_sorted_by_reputation(self, peer_ids: List[str]) -> List[Tuple[str, float]]:
         if self.conn is None:

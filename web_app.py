@@ -13,20 +13,21 @@ from werkzeug.utils import secure_filename
 parser = argparse.ArgumentParser()
 parser.add_argument('--port', type=int, default=5000, help='Web server port')
 parser.add_argument('--name', type=str, default=None, help='Unique name for this peer instance')
+parser.add_argument('--behavior', type=str, default='good', choices=['good', 'freeloader', 'malicious'], help='Peer behavior')
 args = parser.parse_args()
 
 # Initialize Flask
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
+# Reduce logging noise
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# Initialize Global Peer Instance with unique name/storage
-peer = Peer(instance_name=args.name)
+# Initialize Global Peer Instance with unique name/storage and behavior
+peer = Peer(instance_name=args.name, behavior=args.behavior)
 
 def open_folder_dialog():
-    """Opens a native Windows folder picker dialog using PowerShell."""
     try:
         cmd = [
             "powershell.exe", 
@@ -79,6 +80,14 @@ def index():
 def my_files():
     return jsonify(peer.storage.get_shared_files_info())
 
+@app.route('/api/downloads', methods=['GET'])
+def get_downloads():
+    """API for automation scripts to check status."""
+    return jsonify({
+        'active': peer.active_downloads,
+        'history': peer.download_history
+    })
+
 @app.route('/api/search')
 def search():
     query = request.args.get('q', '')
@@ -88,23 +97,34 @@ def search():
 
 @app.route('/api/share', methods=['POST'])
 def share():
-    if 'file' not in request.files:
-        return jsonify({'status': 'error', 'message': 'No file part'})
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'status': 'error', 'message': 'No selected file'})
-    if file:
-        filename = secure_filename(file.filename)
-        # Save to instance-specific upload folder
-        upload_dir = os.path.join(peer.storage.base_dir, 'my_uploads')
-        os.makedirs(upload_dir, exist_ok=True)
-        save_path = os.path.join(upload_dir, filename)
-        try:
-            file.save(save_path)
-            threading.Thread(target=peer.share_file, args=(save_path,), daemon=True).start()
-            return jsonify({'status': 'success', 'message': f'File uploaded and sharing started: {filename}'})
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': str(e)})
+    # Case 1: Handle JSON Path (For Automation Scripts)
+    if request.is_json:
+        data = request.get_json()
+        file_path = data.get('path')
+        if file_path and os.path.exists(file_path):
+            threading.Thread(target=peer.share_file, args=(file_path,), daemon=True).start()
+            return jsonify({'status': 'success', 'message': f'Sharing started for: {file_path}'})
+        return jsonify({'status': 'error', 'message': 'Invalid path provided in JSON'})
+
+    # Case 2: Handle File Upload (For Web UI)
+    if 'file' in request.files:
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'status': 'error', 'message': 'No selected file'})
+        
+        if file:
+            filename = secure_filename(file.filename)
+            upload_dir = os.path.join(peer.storage.base_dir, 'my_uploads')
+            os.makedirs(upload_dir, exist_ok=True)
+            save_path = os.path.join(upload_dir, filename)
+            try:
+                file.save(save_path)
+                threading.Thread(target=peer.share_file, args=(save_path,), daemon=True).start()
+                return jsonify({'status': 'success', 'message': f'File uploaded and sharing started: {filename}'})
+            except Exception as e:
+                return jsonify({'status': 'error', 'message': str(e)})
+
+    return jsonify({'status': 'error', 'message': 'No file or path provided'})
 
 @app.route('/api/browse_destination', methods=['GET'])
 def browse_destination():
@@ -136,5 +156,5 @@ def open_path():
         return jsonify({'status': 'error', 'message': str(e)})
 
 if __name__ == '__main__':
-    print(f"Starting Peer Web UI on http://127.0.0.1:{args.port}")
+    print(f"Starting Peer Web UI on http://127.0.0.1:{args.port} [Behavior: {args.behavior}]")
     socketio.run(app, debug=True, port=args.port, use_reloader=False)

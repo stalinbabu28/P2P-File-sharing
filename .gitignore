@@ -2,4 +2,6 @@
 */__pycache__/
 peer_storage_peer_*/
 identity.json
-peer_data_peer*/
+peer_data*/
+logs/
+metrics_logs/
