@@ -41,7 +41,7 @@ def setup_environment():
     
     f1 = os.path.join(DATA_DIR, "test_20mb.dat")
     if not os.path.exists(f1):
-        print(f"📄 Generating 20MB test file: {f1}")
+        print(f" Generating 20MB test file: {f1}")
         with open(f1, 'wb') as f: f.write(os.urandom(20 * 1024 * 1024))
     
     return f1
@@ -67,7 +67,7 @@ def api_call(port, endpoint, data=None):
 
 def wait_for_file_hash(port):
     """Polls a seeder until they have finished hashing/sharing a file."""
-    print(f"   ⏳ Waiting for Peer :{port} to finish hashing...")
+    print(f"    Waiting for Peer :{port} to finish hashing...")
     for _ in range(30):
         res = api_call(port, "my_files")
         if isinstance(res, list) and len(res) > 0:
@@ -98,7 +98,7 @@ def wait_for_download(port, file_hash, timeout=120):
     return "Timeout"
 
 def kill_processes(procs):
-    print("💀 Killing processes...")
+    print(" Killing processes...")
     for p in procs:
         try:
             if sys.platform == 'win32':
@@ -113,7 +113,7 @@ def kill_processes(procs):
 # --- SCENARIOS ---
 
 def run_scenario_1_baseline(test_file):
-    print("\n🧪 SCENARIO 1: BASELINE (10 Cooperative Peers)")
+    print("\n SCENARIO 1: BASELINE (10 Cooperative Peers)")
     print("   Goal: Measure max throughput and ideal reputation convergence.")
     
     procs = []
@@ -129,30 +129,30 @@ def run_scenario_1_baseline(test_file):
             procs.append(p)
             peers.append(port)
         
-        print("   🚀 10 Peers started. Waiting for initialization...")
+        print("    10 Peers started. Waiting for initialization...")
         time.sleep(5)
 
-        print(f"   📤 Peer 0 sharing file...")
+        print(f"    Peer 0 sharing file...")
         api_call(peers[0], "share", {"path": test_file})
         f_hash = wait_for_file_hash(peers[0])
         if not f_hash: raise Exception("Seeding failed")
 
-        print(f"   ⬇️  Peers 1-9 starting download...")
+        print(f"     Peers 1-9 starting download...")
         for port in peers[1:]:
             api_call(port, "download", {"hash": f_hash})
             time.sleep(0.5)
 
-        print("   👀 Monitoring downloads...")
+        print("    Monitoring downloads...")
         pending = peers[1:]
         start_wait = time.time()
         while pending and (time.time() - start_wait < 300): # 5 min max total
             for p in pending[:]:
                 status = wait_for_download(p, f_hash, timeout=1) 
                 if status == "Complete":
-                    print(f"      ✅ Peer :{p} Finished!")
+                    print(f"       Peer :{p} Finished!")
                     pending.remove(p)
                 elif status != "Timeout" and status != None:
-                    print(f"      ❌ Peer :{p} Failed: {status}")
+                    print(f"       Peer :{p} Failed: {status}")
                     pending.remove(p)
             if len(pending) == 0: break
             time.sleep(2)
@@ -161,7 +161,7 @@ def run_scenario_1_baseline(test_file):
         kill_processes(procs)
 
 def run_scenario_2_fairness(test_file):
-    print("\n🧪 SCENARIO 2: FAIRNESS (Freeloaders)")
+    print("\n SCENARIO 2: FAIRNESS (Freeloaders)")
     print("   Goal: 3 Freeloaders vs 7 Good Peers. Observe reputation penalties.")
     
     procs = []
@@ -187,13 +187,13 @@ def run_scenario_2_fairness(test_file):
         api_call(peers[0], "share", {"path": test_file})
         f_hash = wait_for_file_hash(peers[0])
 
-        print("   ⬇️  Phase 1: Everyone gets file from Peer 0...")
+        print("     Phase 1: Everyone gets file from Peer 0...")
         for port in peers[1:]:
             api_call(port, "download", {"hash": f_hash})
         
         time.sleep(15) 
 
-        print("   🆕 Phase 2: New Peer joins and downloads from swarm...")
+        print("    Phase 2: New Peer joins and downloads from swarm...")
         new_port = BASE_PEER_PORT + 99
         new_name = "Peer_New_Victim"
         p_new = start_process([PYTHON_CMD, "web_app.py", "--port", str(new_port), "--name", new_name, "--behavior", "good"], new_name)
@@ -201,14 +201,14 @@ def run_scenario_2_fairness(test_file):
         time.sleep(3)
         
         api_call(new_port, "download", {"hash": f_hash})
-        print("   👀 Watching interactions (Freeloaders should reject requests)...")
+        print("    Watching interactions (Freeloaders should reject requests)...")
         wait_for_download(new_port, f_hash)
 
     finally:
         kill_processes(procs)
 
 def run_scenario_4_security(test_file):
-    print("\n🧪 SCENARIO 4: SECURITY (Integrity Attack)")
+    print("\n SCENARIO 4: SECURITY (Integrity Attack)")
     print("   Goal: 1 Malicious Seeder vs 1 Good Seeder vs 5 Victims.")
     
     procs = []
@@ -229,14 +229,14 @@ def run_scenario_4_security(test_file):
             
         time.sleep(5)
 
-        print("   😈 Malicious Seeder registers file...")
+        print("    Malicious Seeder registers file...")
         api_call(6000, "share", {"path": test_file})
         f_hash = wait_for_file_hash(6000)
 
-        print("   😇 Good Seeder registers same file...")
+        print("    Good Seeder registers same file...")
         api_call(6001, "share", {"path": test_file})
 
-        print("   🛡️ Victims starting download (Should detect corruption and switch)...")
+        print("    Victims starting download (Should detect corruption and switch)...")
         for v in victims:
             api_call(v, "download", {"hash": f_hash})
         
@@ -254,6 +254,6 @@ if __name__ == "__main__":
     time.sleep(5)
     run_scenario_4_security(test_file)
     
-    print("\n✅ ALL SCENARIOS COMPLETE.")
-    print(f"📂 Data generated in: {LOGS_DIR}")
-    print("📊 Run 'python metrics/analyze_data.py' now!")
+    print("\n ALL SCENARIOS COMPLETE.")
+    print(f" Data generated in: {LOGS_DIR}")
+    print(" Run 'python metrics/analyze_data.py' now!")

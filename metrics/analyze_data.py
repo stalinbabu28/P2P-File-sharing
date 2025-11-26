@@ -8,7 +8,7 @@ LOGS_DIR = "metrics_logs"
 def load_logs():
     data = []
     files = glob.glob(os.path.join(LOGS_DIR, "*.jsonl"))
-    print(f"📂 Found {len(files)} log files.")
+    print(f" Found {len(files)} log files.")
     
     for fpath in files:
         with open(fpath, 'r') as f:
@@ -19,7 +19,7 @@ def load_logs():
     return data
 
 def analyze_throughput(data):
-    print("\n📊 NETWORK THROUGHPUT")
+    print("\nNETWORK THROUGHPUT")
     downloads = [d for d in data if d['event'] == 'download_chunk' and d['status'] == 'success']
     
     if not downloads:
@@ -36,7 +36,7 @@ def analyze_throughput(data):
     print(f"   Peak Chunk Speed:       {max_speed:.2f} Mbps")
 
 def analyze_reputation(data):
-    print("\n🤝 REPUTATION DYNAMICS")
+    print("\n REPUTATION DYNAMICS")
     rep_updates = [d for d in data if d['event'] == 'reputation_update']
     
     # Group by target peer
@@ -51,11 +51,11 @@ def analyze_reputation(data):
     for peer, scores in peer_scores.items():
         start = scores[0]
         end = scores[-1]
-        trend = "↗️" if end > start else "↘️" if end < start else "➡️"
+        trend = "" if end > start else "" if end < start else ""
         print(f"   Peer {peer[:8]}... : {start:.1f} -> {end:.1f} {trend} (Final: {end})")
 
 def analyze_security(data):
-    print("\n🛡️ SECURITY & FAILURES")
+    print("\n SECURITY & FAILURES")
     corrupt = [d for d in data if d['event'] == 'download_chunk' and d['status'] == 'corrupt']
     failed = [d for d in data if d['event'] == 'download_chunk' and d['status'] == 'failed']
     
@@ -72,7 +72,7 @@ def analyze_security(data):
 
 if __name__ == "__main__":
     if not os.path.exists(LOGS_DIR):
-        print("❌ No logs found. Run 'scripts/automated_test.py' first.")
+        print(" No logs found. Run 'scripts/automated_test.py' first.")
     else:
         logs = load_logs()
         analyze_throughput(logs)
